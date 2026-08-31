@@ -3,6 +3,8 @@ import asyncio
 import io
 import re
 import json
+import random
+import time
 from aiohttp import web
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -18,7 +20,6 @@ from telegram.ext import (
 TOKEN = "8736461994:AAFv1d3bIVRGYwB6LgLH4pSLaAXhffmpSHE"
 DATA_FILE = "quizzes_data.json"
 
-# Persistent Storage helpers
 def load_quizzes():
     if os.path.exists(DATA_FILE):
         try:
@@ -34,7 +35,7 @@ def save_quizzes_to_file():
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(user_quizzes, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"Error saving data: {e}")
+        print(f"Storage Error: {e}")
 
 user_quizzes = load_quizzes()
 creation_state = {}
@@ -45,19 +46,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 **Quiz Maker Bot Ready!**\n\n"
         "📌 **Available Commands:**\n"
         "🔹 `/create_quiz` - Naya quiz banayein\n"
-        "🔹 `/done` - Quiz finalize karke save karein\n"
-        "🔹 `/cancel_quiz` - Quiz creation cancel karein\n"
-        "🔹 `/my_quizzes` - Saved quizzes dekhein aur start karein\n"
+        "🔹 `/done` - Quiz save karein\n"
+        "🔹 `/cancel_quiz` - Creation cancel karein\n"
+        "🔹 `/my_quizzes` - Quizzes list & start karein\n"
         "🔹 `/stop` - Running quiz ko rokein"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚙️ **Settings:**\nDefault Poll Timer: 15s\nAnonymous: OFF\nStatus: Online 24/7")
+    await update.message.reply_text("⚙️ **Settings:**\nStatus: Online 24/7\nAnonymous: OFF")
 
 async def create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    creation_state[user_id] = {"title": "", "timer": 15, "questions": [], "step": "TITLE"}
+    creation_state[user_id] = {
+        "title": "",
+        "timer": 15,
+        "shuffle": False,
+        "questions": [],
+        "step": "TITLE"
+    }
     await update.message.reply_text("📝 Apne Quiz ka **Title / Naam** likh kar bhejein:")
 
 async def cancel_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -80,7 +87,7 @@ def parse_single_question(block):
     for line in lines[1:]:
         if re.match(r"^[\(\[]?[A-Da-d1-4][\)\].]", line):
             clean_opt = re.sub(r"^[\(\[]?[A-Da-d1-4][\)\].]\s*", "", line).strip()
-            options.append(clean_opt[:100])  # Telegram Option limit 100 chars
+            options.append(clean_opt[:100])
         elif any(k in line for k in ["उत्तर", "Answer", "Ans", "ans", "ANSWER"]):
             ans_part = line.split(":")[-1].strip() if ":" in line else line
             match = re.search(r"[\(\[]?([A-Da-d1-4])[\)\]]?", ans_part)
@@ -124,18 +131,21 @@ async def finalize_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "id": quiz_id,
         "title": state["title"],
         "timer": state["timer"],
+        "shuffle": state.get("shuffle", False),
         "questions": state["questions"]
     }
     user_quizzes[user_id].append(quiz_data)
     save_quizzes_to_file()
     del creation_state[user_id]
 
+    shuffle_text = "✅ ON" if quiz_data['shuffle'] else "❌ OFF"
     await update.message.reply_text(
         f"🎉 **Quiz Save Ho Gaya!**\n\n"
         f"📌 Title: *{quiz_data['title']}*\n"
         f"📊 Total Questions: *{len(quiz_data['questions'])}*\n"
-        f"⏱ Timer: *{quiz_data['timer']}s per question*\n\n"
-        f"Group mein test start karne ke liye `/my_quizzes` likhein.",
+        f"⏱ Timer: *{quiz_data['timer']}s per question*\n"
+        f"🔀 Shuffle Mode: *{shuffle_text}*\n\n"
+        f"Test start karne ke liye `/my_quizzes` bhejein.",
         parse_mode="Markdown"
     )
 
@@ -205,35 +215,71 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
     if data.startswith("time_"):
         timer_val = int(data.split("_")[1])
         if user_id in creation_state:
             creation_state[user_id]["timer"] = timer_val
-            creation_state[user_id]["step"] = "QUESTIONS"
-            await query.edit_message_text(f"⏱ Timer: **{timer_val}s** set ho gaya.\n\nAb sawal paste karein ya `.txt` file bhej dein. Save karne ke liye `/done` bhejein.")
+            creation_state[user_id]["step"] = "SHUFFLE"
+            
+            keyboard = [
+                [InlineKeyboardButton("🔀 Shuffle: ON", callback_data="shuf_on"), InlineKeyboardButton("➡️ Shuffle: OFF", callback_data="shuf_off")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"⏱ Timer: **{timer_val}s** set ho gaya.\n\nKya aap sawalo ko **Shuffle (Order Mix)** karna chahte hain?",
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
 
-    elif data.startswith("startquiz_"):
+    elif data.startswith("shuf_"):
+        shuf_choice = data.split("_")[1] == "on"
+        if user_id in creation_state:
+            creation_state[user_id]["shuffle"] = shuf_choice
+            creation_state[user_id]["step"] = "QUESTIONS"
+            status_txt = "ON (Sawalo ka order mix hoga)" if shuf_choice else "OFF (Regular order)"
+            await query.edit_message_text(
+                f"🔀 Shuffle Mode: **{status_txt}**\n\n"
+                f"Ab sawal paste karein ya `.txt` file bhej dein. Save karne ke liye `/done` bhejein."
+            )
+
+    elif data.startswith("prequiz_"):
         _, q_owner, q_idx = data.split("_")
-        q_owner = int(q_owner)
-        q_idx = int(q_idx)
-        
+        q_owner, q_idx = int(q_owner), int(q_idx)
         quiz_data = user_quizzes[q_owner][q_idx]
-        chat_id = update.effective_chat.id
-        
-        # Stop existing session if any
+
+        card_text = (
+            f"🎲 Get ready for the quiz '*{quiz_data['title']}*'\n\n"
+            f"✒️ {len(quiz_data['questions'])} questions\n"
+            f"⏱ {quiz_data['timer']} seconds per question\n"
+            f"📰 Votes are *visible* to the quiz owner\n\n"
+            f"🏁 Press the button below when you are ready.\n"
+            f"Send /stop to stop it."
+        )
+        keyboard = [[InlineKeyboardButton("I am ready!", callback_data=f"startready_{q_owner}_{q_idx}")]]
+        await query.message.reply_text(card_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("startready_"):
+        _, q_owner, q_idx = data.split("_")
+        q_owner, q_idx = int(q_owner), int(q_idx)
+        quiz_data = user_quizzes[q_owner][q_idx]
+
         if chat_id in active_sessions:
             active_sessions[chat_id]["is_running"] = False
-        
+
         active_sessions[chat_id] = {
             "quiz": quiz_data,
+            "quiz_owner": q_owner,
+            "quiz_idx": q_idx,
             "index": 0,
-            "scores": {},
+            "start_time": time.time(),
+            "user_stats": {},
             "poll_map": {},
             "is_running": True
         }
-        
-        await query.message.reply_text(f"🚀 **Quiz Shuru:** {quiz_data['title']}\nTotal Questions: {len(quiz_data['questions'])}")
+
+        await query.edit_message_text(f"🚀 **Starting:** {quiz_data['title']}...")
         asyncio.create_task(run_quiz_loop(chat_id, context))
 
 async def my_quizzes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -246,10 +292,65 @@ async def my_quizzes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     for idx, q in enumerate(quizzes):
-        keyboard.append([InlineKeyboardButton(f"▶️ {q['title']} ({len(q['questions'])} Qs)", callback_data=f"startquiz_{user_id}_{idx}")])
+        shuf_icon = "🔀" if q.get("shuffle") else "📄"
+        keyboard.append([InlineKeyboardButton(f"▶️ {shuf_icon} {q['title']} ({len(q['questions'])} Qs)", callback_data=f"prequiz_{user_id}_{idx}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("📚 **Saved Quizzes:**", reply_markup=reply_markup)
+
+async def finish_and_send_result(chat_id, context: ContextTypes.DEFAULT_TYPE):
+    session = active_sessions.get(chat_id)
+    if not session:
+        return
+
+    quiz = session["quiz"]
+    total_q = len(quiz["questions"])
+    total_time = round(time.time() - session["start_time"], 1)
+    user_stats = session.get("user_stats", {})
+
+    q_owner = session.get("quiz_owner", 0)
+    q_idx = session.get("quiz_idx", 0)
+
+    # Leaderboard card
+    sorted_users = sorted(user_stats.values(), key=lambda x: (x["correct"], -x["time"]), reverse=True)
+    total_participants = max(len(sorted_users), 1)
+
+    result_text = f"🏁 The quiz '*{quiz['title']}*' has finished!\n\n"
+    
+    if sorted_users:
+        for rank, u in enumerate(sorted_users, 1):
+            missed = total_q - (u["correct"] + u["wrong"])
+            result_text += (
+                f"👤 *{u['name']}* answered {u['correct'] + u['wrong']} questions:\n"
+                f"✅ Correct – {u['correct']}\n"
+                f"❌ Wrong – {u['wrong']}\n"
+                f"⏳ Missed – {max(0, missed)}\n"
+                f"⏱ {round(u['time'], 1)} sec\n"
+                f"🏆 *{rank}th place out of {total_participants}*\n\n"
+            )
+    else:
+        result_text += "Koi participant nahi jud paya.\n\n"
+
+    result_text += "You can take this quiz again but it will not change your place on the leaderboard."
+
+    bot_me = await context.bot.get_me()
+    share_url = f"https://t.me/share/url?url=https://t.me/{bot_me.username}?start=quiz_{q_owner}_{q_idx}&text=Take%20this%20Quiz!"
+    
+    keyboard = [
+        [InlineKeyboardButton("Try again", callback_data=f"startready_{q_owner}_{q_idx}")],
+        [InlineKeyboardButton("Start quiz in group +", url=f"https://t.me/{bot_me.username}?startgroup=botstart")],
+        [InlineKeyboardButton("Share quiz ↗️", url=share_url)]
+    ]
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=result_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+    if chat_id in active_sessions:
+        del active_sessions[chat_id]
 
 async def run_quiz_loop(chat_id, context: ContextTypes.DEFAULT_TYPE):
     session = active_sessions.get(chat_id)
@@ -257,8 +358,12 @@ async def run_quiz_loop(chat_id, context: ContextTypes.DEFAULT_TYPE):
         return
 
     quiz = session["quiz"]
+    questions_pool = list(quiz["questions"])
     
-    for idx, q_data in enumerate(quiz["questions"]):
+    if quiz.get("shuffle", False):
+        random.shuffle(questions_pool)
+    
+    for idx, q_data in enumerate(questions_pool):
         if not session.get("is_running"):
             break
         
@@ -275,49 +380,51 @@ async def run_quiz_loop(chat_id, context: ContextTypes.DEFAULT_TYPE):
             )
             session["poll_map"][poll_msg.poll.id] = q_data["correct_id"]
         except Exception as e:
-            print(f"Error sending poll: {e}")
+            print(f"Poll Send Error: {e}")
             continue
 
-        # Wait for timer
         for _ in range(quiz["timer"] + 2):
             if not session.get("is_running"):
                 break
             await asyncio.sleep(1)
 
     if session.get("is_running"):
-        scores = session["scores"]
-        leaderboard = f"🏁 **Quiz Finished: {quiz['title']}**\n\n🏆 **Leaderboard:**\n\n"
-        if not scores:
-            leaderboard += "Kisi ne sahi jawab nahi diya."
-        else:
-            sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-            for rank, (name, score) in enumerate(sorted_scores, 1):
-                medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else "🔹"
-                leaderboard += f"{medal} {rank}. {name} — {score} Marks\n"
-        
-        await context.bot.send_message(chat_id=chat_id, text=leaderboard, parse_mode="Markdown")
-        if chat_id in active_sessions:
-            del active_sessions[chat_id]
+        await finish_and_send_result(chat_id, context)
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.poll_answer
     poll_id = answer.poll_id
-    user_name = update.effective_user.first_name
+    user = answer.user
+    user_id = user.id
+    user_name = user.first_name
 
     for chat_id, session in active_sessions.items():
         if poll_id in session["poll_map"]:
             correct_id = session["poll_map"][poll_id]
+            
+            if user_id not in session["user_stats"]:
+                session["user_stats"][user_id] = {
+                    "name": user_name,
+                    "correct": 0,
+                    "wrong": 0,
+                    "time": 0.0
+                }
+            
             if answer.option_ids and answer.option_ids[0] == correct_id:
-                session["scores"][user_name] = session["scores"].get(user_name, 0) + 1
+                session["user_stats"][user_id]["correct"] += 1
+            else:
+                session["user_stats"][user_id]["wrong"] += 1
+            
+            session["user_stats"][user_id]["time"] = time.time() - session["start_time"]
 
 async def stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in active_sessions and active_sessions[chat_id].get("is_running"):
         active_sessions[chat_id]["is_running"] = False
-        del active_sessions[chat_id]
-        await update.message.reply_text("🛑 **Quiz safalta-purvak rokk diya gaya hai.**")
+        await update.message.reply_text("🛑 Stopping quiz...")
+        await finish_and_send_result(chat_id, context)
     else:
-        await update.message.reply_text("⚠️ Abhi koi quiz running nahi hai.")
+        await update.message.reply_text("⚠️ Abhi koi running quiz nahi hai.")
 
 async def handle_http(request):
     return web.Response(text="Dulhin Bazar Quiz Bot is Active 24/7!")
@@ -346,7 +453,7 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    print("Quiz Bot System Online...")
+    print("Dulhin Bazar Quiz Bot System Online...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
@@ -356,4 +463,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
