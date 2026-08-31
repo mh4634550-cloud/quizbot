@@ -23,18 +23,31 @@ active_sessions = {}
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 **Quiz Maker Bot Ready!**\n\n"
-        "📌 **Commands:**\n"
-        "🔹 `/create_quiz` - Naya quiz banayein (Bulk / File 500+ Qs)\n"
-        "🔹 `/done` - Quiz finalize karke save karein\n"
+        "📌 **Available Commands:**\n"
+        "🔹 `/create_quiz` - Naya quiz banayein\n"
+        "🔹 `/done` - Current quiz save karein\n"
+        "🔹 `/cancel_quiz` - Current quiz creation cancel karein\n"
         "🔹 `/my_quizzes` - Saved quizzes dekhein aur start karein\n"
-        "🔹 `/stop` - Quiz ko rokein"
+        "🔹 `/stop` - Running quiz ko rokein\n"
+        "🔹 `/settings` - Bot settings dekhein"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
+
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⚙️ **Settings:**\nDefault Poll Timer: 15s\nAnonymous Voting: OFF\nStatus: Online 24/7")
 
 async def create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     creation_state[user_id] = {"title": "", "timer": 15, "questions": [], "step": "TITLE"}
     await update.message.reply_text("📝 Apne Quiz ka **Title / Naam** likh kar bhejein:")
+
+async def cancel_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in creation_state:
+        del creation_state[user_id]
+        await update.message.reply_text("❌ Quiz creation cancel kar diya gaya hai.")
+    else:
+        await update.message.reply_text("⚠️ Koi active quiz creation process nahi chal raha hai.")
 
 def parse_single_question(block):
     lines = [l.strip() for l in block.split("\n") if l.strip()]
@@ -72,7 +85,7 @@ def parse_bulk_questions(text):
 async def finalize_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in creation_state:
-        await update.message.reply_text("⚠️ Koi active quiz creation nahi chal raha hai.")
+        await update.message.reply_text("⚠️ Koi active quiz creation nahi chal raha hai. Naya quiz banane ke liye `/create_quiz` karein.")
         return
 
     state = creation_state[user_id]
@@ -98,7 +111,7 @@ async def finalize_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📌 Title: *{quiz_data['title']}*\n"
         f"📊 Total Questions: *{len(quiz_data['questions'])}*\n"
         f"⏱ Timer: *{quiz_data['timer']}s per question*\n\n"
-        f"Quiz chalane ke liye group mein `/my_quizzes` bhejein.",
+        f"Quiz start karne ke liye kisi group mein bot ko add karke `/my_quizzes` likhein.",
         parse_mode="Markdown"
     )
 
@@ -122,7 +135,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📁 **File se {len(bulk_parsed)} Questions** add ho gaye!\n"
             f"Total Questions: **{len(creation_state[user_id]['questions'])}**\n\n"
-            f"Aur bhejein ya save karne ke liye `/done` likhein."
+            f"Save karne ke liye `/done` par tap karein."
         )
     else:
         await update.message.reply_text("⚠️ File ke questions ka format match nahi hua.")
@@ -158,7 +171,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ **{len(bulk_parsed)} Questions** add ho gaye!\n"
                 f"Total abhi tak: **{len(state['questions'])}**\n\n"
-                f"Aur text paste karein, `.txt` file bhejein, ya `/done` likhein."
+                f"Aur text paste karein ya finalize karne ke liye `/done` bhejein."
             )
         else:
             await update.message.reply_text("⚠️ Format check karein (Question, 4 options aur Answer hona zaroori hai).")
@@ -174,7 +187,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id in creation_state:
             creation_state[user_id]["timer"] = timer_val
             creation_state[user_id]["step"] = "QUESTIONS"
-            await query.edit_message_text(f"⏱ Timer: **{timer_val}s** set ho gaya.\n\nAb sawal paste karein ya seedhe `.txt` file bhej dein. Complete hone par `/done` bhejein.")
+            await query.edit_message_text(f"⏱ Timer: **{timer_val}s** set ho gaya.\n\nAb sawal paste karein ya seedhe `.txt` file bhej dein. Save karne ke liye `/done` bhejein.")
 
     elif data.startswith("startquiz_"):
         _, q_owner, q_idx = data.split("_")
@@ -199,7 +212,7 @@ async def my_quizzes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quizzes = user_quizzes.get(user_id, [])
 
     if not quizzes:
-        await update.message.reply_text("📂 Koi saved quiz nahi hai. Pehle `/create_quiz` karein.")
+        await update.message.reply_text("📂 Koi saved quiz nahi hai. Pehle `/create_quiz` karke quiz banayein.")
         return
 
     keyboard = []
@@ -267,7 +280,7 @@ async def stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del active_sessions[chat_id]
         await update.message.reply_text("🛑 Quiz rokk diya gaya hai.")
     else:
-        await update.message.reply_text("⚠️ Abhi koi quiz nahi chal raha hai.")
+        await update.message.reply_text("⚠️ Abhi koi running quiz nahi hai.")
 
 async def handle_http(request):
     return web.Response(text="Bot is active and running 24/7!")
@@ -275,11 +288,16 @@ async def handle_http(request):
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # Commands Registered
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("settings", settings))
     app.add_handler(CommandHandler("create_quiz", create_quiz))
     app.add_handler(CommandHandler("done", finalize_quiz))
+    app.add_handler(CommandHandler("cancel_quiz", cancel_quiz))
     app.add_handler(CommandHandler("my_quizzes", my_quizzes))
     app.add_handler(CommandHandler("stop", stop_quiz))
+    
+    # Handlers
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -303,4 +321,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
