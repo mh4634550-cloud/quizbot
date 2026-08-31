@@ -1,2 +1,4 @@
-python-telegram-bot[job-queue]
+python-telegram-bot>=20.0
 aiohttp
+google-generativeai
+Pillow
