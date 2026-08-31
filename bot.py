@@ -5,6 +5,7 @@ import re
 import json
 import random
 import time
+import urllib.request
 from aiohttp import web
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -19,6 +20,7 @@ from telegram.ext import (
 
 TOKEN = "8736461994:AAFv1d3bIVRGYwB6LgLH4pSLaAXhffmpSHE"
 DATA_FILE = "quizzes_data.json"
+RENDER_APP_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 def load_quizzes():
     if os.path.exists(DATA_FILE):
@@ -305,13 +307,11 @@ async def finish_and_send_result(chat_id, context: ContextTypes.DEFAULT_TYPE):
 
     quiz = session["quiz"]
     total_q = len(quiz["questions"])
-    total_time = round(time.time() - session["start_time"], 1)
     user_stats = session.get("user_stats", {})
 
     q_owner = session.get("quiz_owner", 0)
     q_idx = session.get("quiz_idx", 0)
 
-    # Leaderboard card
     sorted_users = sorted(user_stats.values(), key=lambda x: (x["correct"], -x["time"]), reverse=True)
     total_participants = max(len(sorted_users), 1)
 
@@ -429,6 +429,18 @@ async def stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_http(request):
     return web.Response(text="Dulhin Bazar Quiz Bot is Active 24/7!")
 
+async def keep_alive():
+    """Background task to ping self every 5 minutes so Render never sleeps."""
+    await asyncio.sleep(30)
+    url = f"https://quizbot-1vsr.onrender.com"
+    while True:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+        await asyncio.sleep(300)
+
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -453,7 +465,9 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    print("Dulhin Bazar Quiz Bot System Online...")
+    asyncio.create_task(keep_alive())
+
+    print("Dulhin Bazar Quiz Bot 24/7 Keep-Alive Started...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
@@ -463,3 +477,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+            
