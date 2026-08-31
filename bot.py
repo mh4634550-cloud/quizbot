@@ -25,6 +25,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 **Quiz Maker Bot Ready!**\n\n"
         "📌 **Commands:**\n"
         "🔹 `/create_quiz` - Naya quiz banayein (Bulk / File 500+ Qs)\n"
+        "🔹 `/done` - Quiz finalize karke save karein\n"
         "🔹 `/my_quizzes` - Saved quizzes dekhein aur start karein\n"
         "🔹 `/stop` - Quiz ko rokein"
     )
@@ -68,6 +69,39 @@ def parse_bulk_questions(text):
                 parsed_list.append(q_data)
     return parsed_list
 
+async def finalize_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in creation_state:
+        await update.message.reply_text("⚠️ Koi active quiz creation nahi chal raha hai.")
+        return
+
+    state = creation_state[user_id]
+    if not state["questions"]:
+        await update.message.reply_text("⚠️ Kam se kam 1 question add karein!")
+        return
+
+    if user_id not in user_quizzes:
+        user_quizzes[user_id] = []
+
+    quiz_id = f"q_{len(user_quizzes[user_id]) + 1}"
+    quiz_data = {
+        "id": quiz_id,
+        "title": state["title"],
+        "timer": state["timer"],
+        "questions": state["questions"]
+    }
+    user_quizzes[user_id].append(quiz_data)
+    del creation_state[user_id]
+
+    await update.message.reply_text(
+        f"🎉 **Quiz Save Ho Gaya!**\n\n"
+        f"📌 Title: *{quiz_data['title']}*\n"
+        f"📊 Total Questions: *{len(quiz_data['questions'])}*\n"
+        f"⏱ Timer: *{quiz_data['timer']}s per question*\n\n"
+        f"Quiz chalane ke liye group mein `/my_quizzes` bhejein.",
+        parse_mode="Markdown"
+    )
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in creation_state or creation_state[user_id]["step"] != "QUESTIONS":
@@ -88,7 +122,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📁 **File se {len(bulk_parsed)} Questions** add ho gaye!\n"
             f"Total Questions: **{len(creation_state[user_id]['questions'])}**\n\n"
-            f"Aur bhejein ya complete karne ke liye `/done` likhein."
+            f"Aur bhejein ya save karne ke liye `/done` likhein."
         )
     else:
         await update.message.reply_text("⚠️ File ke questions ka format match nahi hua.")
@@ -114,32 +148,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state["step"] == "QUESTIONS":
-        if text.lower() == "/done":
-            if not state["questions"]:
-                await update.message.reply_text("⚠️ Kam se kam 1 question add karein!")
-                return
-            
-            if user_id not in user_quizzes:
-                user_quizzes[user_id] = []
-            
-            quiz_id = f"q_{len(user_quizzes[user_id]) + 1}"
-            quiz_data = {
-                "id": quiz_id,
-                "title": state["title"],
-                "timer": state["timer"],
-                "questions": state["questions"]
-            }
-            user_quizzes[user_id].append(quiz_data)
-            del creation_state[user_id]
-
-            await update.message.reply_text(
-                f"🎉 **Quiz Save Ho Gaya!**\n\n"
-                f"📌 Title: *{quiz_data['title']}*\n"
-                f"📊 Total Questions: *{len(quiz_data['questions'])}*\n"
-                f"⏱ Timer: *{quiz_data['timer']}s per question*\n\n"
-                f"Quiz chalane ke liye group mein `/my_quizzes` bhejein.",
-                parse_mode="Markdown"
-            )
+        if text.lower() in ["/done", "done"]:
+            await finalize_quiz(update, context)
             return
 
         bulk_parsed = parse_bulk_questions(text)
@@ -267,6 +277,7 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("create_quiz", create_quiz))
+    app.add_handler(CommandHandler("done", finalize_quiz))
     app.add_handler(CommandHandler("my_quizzes", my_quizzes))
     app.add_handler(CommandHandler("stop", stop_quiz))
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -274,7 +285,6 @@ async def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Fake Web Server to satisfy Render Free Tier Port requirement
     server = web.Application()
     server.router.add_get("/", handle_http)
     runner = web.AppRunner(server)
@@ -293,3 +303,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
