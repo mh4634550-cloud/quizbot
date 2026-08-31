@@ -1,4 +1,5 @@
 import asyncio
+import io
 import re
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -19,18 +20,76 @@ active_sessions = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 **Quiz Maker Bot Mein Aapka Swagat Hai!**\n\n"
+        "👋 **Quiz Maker Bot Ready!**\n\n"
         "📌 **Commands:**\n"
-        "🔹 `/create_quiz` - Naya custom quiz banayein\n"
-        "🔹 `/my_quizzes` - Apne banaye huye quizzes dekhein\n"
-        "🔹 `/stop` - Chal rahe quiz ko rokein"
+        "🔹 `/create_quiz` - Naya quiz banayein (Bulk/File 500+ Qs)\n"
+        "🔹 `/my_quizzes` - Saved quizzes dekhein aur start karein\n"
+        "🔹 `/stop` - Quiz ko rokein"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     creation_state[user_id] = {"title": "", "timer": 15, "questions": [], "step": "TITLE"}
-    await update.message.reply_text("📝 Pehle apne Quiz ka **Title / Naam** likh kar bhejein:")
+    await update.message.reply_text("📝 Apne Quiz ka **Title / Naam** likh kar bhejein:")
+
+def parse_single_question(block):
+    lines = [l.strip() for l in block.split("\n") if l.strip()]
+    if len(lines) < 3:
+        return None
+    
+    q_text = re.sub(r"^(Q\s*\d+[\.\)]|\d+[\.\)])\s*", "", lines[0]).strip()
+    options = []
+    correct_idx = 0
+
+    for line in lines[1:]:
+        if re.match(r"^[\(\[]?[A-Da-d1-4][\)\].]", line):
+            clean_opt = re.sub(r"^[\(\[]?[A-Da-d1-4][\)\].]\s*", "", line).strip()
+            options.append(clean_opt)
+        elif any(k in line for k in ["उत्तर", "Answer", "Ans", "ans", "ANSWER"]):
+            if "A" in line or "1" in line: correct_idx = 0
+            elif "B" in line or "2" in line: correct_idx = 1
+            elif "C" in line or "3" in line: correct_idx = 2
+            elif "D" in line or "4" in line: correct_idx = 3
+
+    if len(options) >= 2:
+        return {"question": q_text, "options": options[:4], "correct_id": correct_idx}
+    return None
+
+def parse_bulk_questions(text):
+    blocks = re.split(r"\n\s*\n|(?=\n\s*(?:Q\s*\d+[\.\)]|\d+[\.\)]))", text)
+    parsed_list = []
+    for b in blocks:
+        if b.strip():
+            q_data = parse_single_question(b.strip())
+            if q_data:
+                parsed_list.append(q_data)
+    return parsed_list
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in creation_state or creation_state[user_id]["step"] != "QUESTIONS":
+        return
+
+    doc = update.message.document
+    if not doc.file_name.endswith(('.txt', '.text')):
+        await update.message.reply_text("⚠️ Kripya `.txt` format ki text file bhejein.")
+        return
+
+    file = await context.bot.get_file(doc.file_id)
+    file_bytes = await file.download_as_bytearray()
+    content = file_bytes.decode('utf-8', errors='ignore')
+
+    bulk_parsed = parse_bulk_questions(content)
+    if bulk_parsed:
+        creation_state[user_id]["questions"].extend(bulk_parsed)
+        await update.message.reply_text(
+            f"📁 **File se {len(bulk_parsed)} Questions** add ho gaye!\n"
+            f"Total Questions: **{len(creation_state[user_id]['questions'])}**\n\n"
+            f"Aur bhejein ya complete karne ke liye `/done` likhein."
+        )
+    else:
+        await update.message.reply_text("⚠️ File ke questions ka format match nahi hua.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -72,43 +131,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del creation_state[user_id]
 
             await update.message.reply_text(
-                f"🎉 **Quiz Ban Gaya!**\n\n"
-                f"Title: *{quiz_data['title']}*\n"
-                f"Questions: *{len(quiz_data['questions'])}*\n\n"
-                f"Quiz chalane ke liye `/my_quizzes` likhein.",
+                f"🎉 **Quiz Save Ho Gaya!**\n\n"
+                f"📌 Title: *{quiz_data['title']}*\n"
+                f"📊 Total Questions: *{len(quiz_data['questions'])}*\n"
+                f"⏱ Timer: *{quiz_data['timer']}s per question*\n\n"
+                f"Quiz chalane ke liye group mein `/my_quizzes` bhejein.",
                 parse_mode="Markdown"
             )
             return
 
-        parsed_q = parse_question_block(text)
-        if parsed_q:
-            state["questions"].append(parsed_q)
-            await update.message.reply_text(f"✅ Question #{len(state['questions'])} add ho gaya! Agla bhejein ya `/done` likhein.")
+        bulk_parsed = parse_bulk_questions(text)
+        if bulk_parsed:
+            state["questions"].extend(bulk_parsed)
+            await update.message.reply_text(
+                f"✅ **{len(bulk_parsed)} Questions** add ho gaye!\n"
+                f"Total abhi tak: **{len(state['questions'])}**\n\n"
+                f"Aur text paste karein, `.txt` file bhejein, ya `/done` likhein."
+            )
         else:
-            await update.message.reply_text("⚠️ Format sahi nahi hai. Question, 4 options aur answer bhejein.")
-
-def parse_question_block(text):
-    try:
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        q_text = lines[0]
-        options = []
-        correct_idx = 0
-
-        for line in lines[1:]:
-            if re.match(r"^[\(\[]?[A-Da-d1-4][\)\].]", line):
-                clean_opt = re.sub(r"^[\(\[]?[A-Da-d1-4][\)\].]\s*", "", line)
-                options.append(clean_opt)
-            elif "उत्तर" in line or "Answer" in line or "Ans" in line:
-                if "A" in line or "1" in line: correct_idx = 0
-                elif "B" in line or "2" in line: correct_idx = 1
-                elif "C" in line or "3" in line: correct_idx = 2
-                elif "D" in line or "4" in line: correct_idx = 3
-
-        if len(options) >= 2:
-            return {"question": q_text, "options": options[:4], "correct_id": correct_idx}
-        return None
-    except Exception:
-        return None
+            await update.message.reply_text("⚠️ Format check karein (Question, 4 options aur Answer hona zaroori hai).")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -121,7 +162,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id in creation_state:
             creation_state[user_id]["timer"] = timer_val
             creation_state[user_id]["step"] = "QUESTIONS"
-            await query.edit_message_text(f"⏱ Timer: **{timer_val}s** set ho gaya.\n\nAb sawal bhejein, complete hone par `/done` likhein.")
+            await query.edit_message_text(f"⏱ Timer: **{timer_val}s** set ho gaya.\n\nAb sawal paste karein ya seedhe `.txt` file bhej dein (500+ questions support). Complete hone par `/done` bhejein.")
 
     elif data.startswith("startquiz_"):
         _, q_owner, q_idx = data.split("_")
@@ -138,7 +179,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "poll_map": {}
         }
         
-        await query.message.reply_text(f"🚀 **Quiz Shuru:** {quiz_data['title']}")
+        await query.message.reply_text(f"🚀 **Quiz Shuru:** {quiz_data['title']}\nTotal Questions: {len(quiz_data['questions'])}")
         await send_quiz_poll(chat_id, context)
 
 async def my_quizzes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -166,9 +207,9 @@ async def send_quiz_poll(chat_id, context: ContextTypes.DEFAULT_TYPE):
 
     if idx >= len(quiz["questions"]):
         scores = session["scores"]
-        leaderboard = "🏁 **Quiz Leaderboard:**\n\n"
+        leaderboard = f"🏁 **Quiz Finished: {quiz['title']}**\n\n🏆 **Leaderboard:**\n\n"
         if not scores:
-            leaderboard += "Kisi ne sahi jawab nahi diya."
+            leaderboard += "Kisi ne score nahi kiya."
         else:
             sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
             for rank, (name, score) in enumerate(sorted_scores, 1):
@@ -225,8 +266,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", stop_quiz))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("Exam Quiz Maker Bot 24/7 Started...")
     app.run_polling()
-  
