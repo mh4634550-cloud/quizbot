@@ -1,6 +1,8 @@
+import os
 import asyncio
 import io
 import re
+from aiohttp import web
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -22,7 +24,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 **Quiz Maker Bot Ready!**\n\n"
         "📌 **Commands:**\n"
-        "🔹 `/create_quiz` - Naya quiz banayein (Bulk/File 500+ Qs)\n"
+        "🔹 `/create_quiz` - Naya quiz banayein (Bulk / File 500+ Qs)\n"
         "🔹 `/my_quizzes` - Saved quizzes dekhein aur start karein\n"
         "🔹 `/stop` - Quiz ko rokein"
     )
@@ -162,7 +164,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id in creation_state:
             creation_state[user_id]["timer"] = timer_val
             creation_state[user_id]["step"] = "QUESTIONS"
-            await query.edit_message_text(f"⏱ Timer: **{timer_val}s** set ho gaya.\n\nAb sawal paste karein ya seedhe `.txt` file bhej dein (500+ questions support). Complete hone par `/done` bhejein.")
+            await query.edit_message_text(f"⏱ Timer: **{timer_val}s** set ho gaya.\n\nAb sawal paste karein ya seedhe `.txt` file bhej dein. Complete hone par `/done` bhejein.")
 
     elif data.startswith("startquiz_"):
         _, q_owner, q_idx = data.split("_")
@@ -257,7 +259,10 @@ async def stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ Abhi koi quiz nahi chal raha hai.")
 
-if __name__ == "__main__":
+async def handle_http(request):
+    return web.Response(text="Bot is active and running 24/7!")
+
+async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -269,5 +274,22 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    # Fake Web Server to satisfy Render Free Tier Port requirement
+    server = web.Application()
+    server.router.add_get("/", handle_http)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
     print("Exam Quiz Maker Bot 24/7 Started...")
-    app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    while True:
+        await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    asyncio.run(main())
