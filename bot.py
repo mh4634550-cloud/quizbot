@@ -49,7 +49,6 @@ Answer: Correct Option Letter (A/B/C/D)
 
 Leave a blank line between each question. Output ONLY questions and answers."""
 
-# Direct Universal REST Call (Works with both AQ. and AIzaSy. keys)
 async def call_gemini_api(prompt, image_bytes=None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
     
@@ -451,6 +450,31 @@ async def keep_alive():
             pass
         await asyncio.sleep(300)
 
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CmmandHandler("start", start))
+    app.add_handler(CommandHandler("create_quiz", create_quiz_cmd))
+    app.add_handler(CommandHandler("done", finalize_quiz))
+    app.add_handler(CommandHandler("store", store_cmd))
+    app.add_handler(CommandHandler("stop", stop_quiz_cmd))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(PollAnswerHandler(handle_answer))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
+    app.add_handler(MessageHandler(filters.TEXT, handle_text))
+
+    server = web.Application()
+    server.router.add_get("/", handle_http)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080))).start()
+    asyncio.create_task(keep_alive())
+    print("Bot Live...")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    while True:
+        await asyncio.sleep(3600)
+
 if __name__ == "__main__":
     asyncio.run(main())
-    
