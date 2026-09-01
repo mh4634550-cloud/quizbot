@@ -49,6 +49,7 @@ Answer: Correct Option Letter (A/B/C/D)
 
 Leave a blank line between each question. Output ONLY questions and answers."""
 
+# Direct Universal REST Call (Works with both AQ. and AIzaSy. keys)
 async def call_gemini_api(prompt, image_bytes=None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
     
@@ -452,7 +453,7 @@ async def keep_alive():
 
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CmmandHandler("start", start))
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("create_quiz", create_quiz_cmd))
     app.add_handler(CommandHandler("done", finalize_quiz))
     app.add_handler(CommandHandler("store", store_cmd))
