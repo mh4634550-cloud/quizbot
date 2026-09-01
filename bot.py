@@ -49,9 +49,14 @@ Answer: Correct Option Letter (A/B/C/D)
 
 Leave a blank line between each question. Output ONLY questions and answers."""
 
-# Direct Universal REST Call (Works with both AQ. and AIzaSy. keys)
+# Auto fallback across multiple endpoints & models
 async def call_gemini_api(prompt, image_bytes=None):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    endpoints = [
+        ("v1beta", "gemini-1.5-flash"),
+        ("v1", "gemini-1.5-flash"),
+        ("v1beta", "gemini-1.5-pro"),
+        ("v1beta", "gemini-pro"),
+    ]
     
     parts = []
     if image_bytes:
@@ -63,18 +68,24 @@ async def call_gemini_api(prompt, image_bytes=None):
             }
         })
     parts.append({"text": prompt})
+    payload = {"contents": [{"parts": parts}]}
     
-    payload = {
-        "contents": [{"parts": parts}]
-    }
-    
+    last_err = ""
     async with ClientSession() as session:
-        async with session.post(url, json=payload, headers={"Content-Type": "application/json"}) as resp:
-            if resp.status != 200:
-                err_body = await resp.text()
-                raise Exception(f"API Error ({resp.status}): {err_body[:100]}")
-            data = await resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+        for ver, mod in endpoints:
+            url = f"https://generativelanguage.googleapis.com/{ver}/models/{mod}:generateContent?key={GEMINI_KEY}"
+            try:
+                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+                    else:
+                        last_err = await resp.text()
+            except Exception as e:
+                last_err = str(e)
+                continue
+                
+    raise Exception(f"AI Connection Failed: {last_err[:120]}")
 
 def parse_questions(text):
     out = []
