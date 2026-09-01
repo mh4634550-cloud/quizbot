@@ -63,7 +63,21 @@ def parse_questions(text):
     return out
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Dulhin Bazar Quiz Bot**\n\n🔹 `/create_quiz` - Create Quiz\n🔹 `/store` - Quiz Store\n🔹 `/stop` - Stop Quiz", parse_mode="Markdown")
+    await update.message.reply_text("👋 **Dulhin Bazar Quiz Bot**\n\n🔹 `/create_quiz` - Create Quiz\n🔹 `/store` - Quiz Store\n🔹 `/mystore` - Dashboard\n🔹 `/stop` - Stop Quiz", parse_mode="Markdown")
+
+async def mystore_view(uid, message):
+    user_quizzes = [v for k, v in db.get("quizzes", {}).items() if v.get("owner") == uid]
+    user_bought = [db["quizzes"][x] for x in db.get("purchases", {}).get(str(uid), []) if x in db.get("quizzes", {})]
+    
+    text = f"🏪 **Aapka Store Dashboard**\n\n🆔 User ID: `{uid}`\n🛠 Created Quizzes: {len(user_quizzes)}\n📦 Unlocked: {len(user_bought)}"
+    kb = []
+    for q in user_quizzes:
+        kb.append([InlineKeyboardButton(f"▶️ Play: {q['title']}", callback_data=f"view_{q['id']}")])
+    kb.append([InlineKeyboardButton("🛒 Main Store", callback_data="back_store")])
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+async def mystore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await mystore_view(update.effective_user.id, update.message)
 
 async def create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     creation_state[update.effective_user.id] = {"title": "", "subject": "General", "price": 0, "timer": 15, "questions": [], "step": "TITLE"}
@@ -88,17 +102,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in creation_state or creation_state[uid]["step"] != "QUESTIONS":
         return
-    msg = await update.message.reply_text("🔍 AI Scanning photo...")
+    msg = await update.message.reply_text("⚡ AI Scanning photo...")
     try:
-        f = await (await context.bot.get_file(update.message.photo[-1].file_id)).download_as_bytearray()
-        qs = parse_questions(ai_model.generate_content([AI_PROMPT, Image.open(io.BytesIO(f))]).text)
+        photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
+        f_bytes = await photo_file.download_as_bytearray()
+        
+        # Fast Image Processing
+        img = Image.open(io.BytesIO(f_bytes))
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(None, lambda: ai_model.generate_content([AI_PROMPT, img]))
+        
+        qs = parse_questions(response.text)
         if qs:
             creation_state[uid]["questions"].extend(qs)
-            await msg.edit_text(f"✅ AI ne {len(qs)} Qs add kiye! Total: {len(creation_state[uid]['questions'])}\nAur photos bhejein ya save ke liye `/done` likhein.")
+            await msg.edit_text(f"✅ AI ne {len(qs)} Qs add kiye! Total: {len(creation_state[uid]['questions'])}\n\nAur photo bhejein ya save karne ke liye `/done` likhein.")
         else:
-            await msg.edit_text("⚠️ Image saaf nahi aayi.")
-    except Exception:
-        await msg.edit_text("⚠️ OCR Error.")
+            await msg.edit_text("⚠️ Image saaf nahi aayi ya questions detect nahi hue. Dobara koshish karein.")
+    except Exception as e:
+        await msg.edit_text("⚠️ OCR processing error. Dobara photo bhejein.")
 
 async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -143,19 +164,39 @@ async def store(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price_tag = "FREE" if q["price"] == 0 else f"₹{q['price']}"
         btn_title = f"{q['title']} - {price_tag}"
         kb.append([InlineKeyboardButton(btn_title, callback_data=f"view_{qid}")])
+    kb.append([InlineKeyboardButton("🏪 My Store", callback_data="open_mystore")])
     await update.message.reply_text("📚 **Quiz Store:**", reply_markup=InlineKeyboardMarkup(kb))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await q.answer()  # Instant click feedback
     d = q.data
     uid = update.effective_user.id
     cid = update.effective_chat.id
 
-    if d.startswith("p_"):
+    if d == "open_mystore":
+        user_quizzes = [v for k, v in db.get("quizzes", {}).items() if v.get("owner") == uid]
+        user_bought = [db["quizzes"][x] for x in db.get("purchases", {}).get(str(uid), []) if x in db.get("quizzes", {})]
+        text = f"🏪 **Aapka Store Dashboard**\n\n🆔 User ID: `{uid}`\n🛠 Created Quizzes: {len(user_quizzes)}\n📦 Unlocked: {len(user_bought)}"
+        kb = []
+        for qz_item in user_quizzes:
+            kb.append([InlineKeyboardButton(f"▶️ Play: {qz_item['title']}", callback_data=f"view_{qz_item['id']}")])
+        kb.append([InlineKeyboardButton("⬅️ Back to Store", callback_data="back_store")])
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+    elif d == "back_store":
+        kb = []
+        for qid, qz_item in db["quizzes"].items():
+            price_tag = "FREE" if qz_item["price"] == 0 else f"₹{qz_item['price']}"
+            kb.append([InlineKeyboardButton(f"{qz_item['title']} - {price_tag}", callback_data=f"view_{qid}")])
+        kb.append([InlineKeyboardButton("🏪 My Store", callback_data="open_mystore")])
+        await q.edit_message_text("📚 **Quiz Store:**", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif d.startswith("p_"):
         creation_state[uid]["price"] = int(d.split("_")[1])
         creation_state[uid]["step"] = "QUESTIONS"
         await q.edit_message_text("📸 **Ab direct book page ki PHOTO bhejein** ya `.txt` file bhej kar `/done` karein.")
+
     elif d.startswith("view_"):
         qid = d.split("_", 1)[1]
         qz = db["quizzes"].get(qid)
@@ -168,10 +209,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = [[InlineKeyboardButton("I am ready!", callback_data=f"start_{qid}")]]
         else:
             kb = [[InlineKeyboardButton(f"💳 Buy Now (₹{qz['price']})", callback_data=f"buy_{qid}")]]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back_store")])
         await q.edit_message_text(card, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
     elif d.startswith("buy_"):
         qz = db["quizzes"].get(d.split("_", 1)[1])
         await q.edit_message_text(f"💳 Pay ₹{qz['price']} to UPI: `{UPI_ID}`\nBhejein details Admin ko:\nUID: `{uid}` | QID: `{qz['id']}`", parse_mode="Markdown")
+
     elif d.startswith("start_"):
         qid = d.split("_", 1)[1]
         active_sessions[cid] = {"quiz": db["quizzes"][qid], "stats": {}, "map": {}, "run": True}
@@ -233,7 +277,7 @@ async def keep_alive():
 
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
-    for c, h in [("start", start), ("create_quiz", create_quiz), ("done", finalize_quiz), ("store", store), ("stop", stop_quiz)]:
+    for c, h in [("start", start), ("create_quiz", create_quiz), ("mystore", mystore_cmd), ("done", finalize_quiz), ("store", store), ("stop", stop_quiz)]:
         app.add_handler(CommandHandler(c, h))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(PollAnswerHandler(handle_answer))
