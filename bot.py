@@ -1,7 +1,6 @@
-import os, asyncio, io, re, json, random, time, urllib.request, urllib.parse
-from aiohttp import web
+import os, asyncio, io, re, json, random, time, urllib.request, urllib.parse, base64
+from aiohttp import web, ClientSession
 from PIL import Image
-import google.generativeai as genai
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, PollAnswerHandler, ContextTypes, filters
 
@@ -9,17 +8,13 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 
-# Pure Environment Variables (No Hardcoded Tokens)
 TOKEN = os.environ.get("BOT_TOKEN")
 UPI_ID = os.environ.get("UPI_ID", "marufhussain318-2@oksbi")
 GEMINI_KEY = os.environ.get("GEMINI_KEY")
 DATA_FILE = "quiz_db.json"
 
 if not TOKEN or not GEMINI_KEY:
-    raise ValueError("BOT_TOKEN ya GEMINI_KEY set nahi hai! Render dashboard ke Environment tab par add karein.")
-
-genai.configure(api_key=GEMINI_KEY)
-ai_model = genai.GenerativeModel("gemini-1.5-flash")
+    raise ValueError("BOT_TOKEN ya GEMINI_KEY set nahi hai!")
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -53,6 +48,33 @@ D) Option 4
 Answer: Correct Option Letter (A/B/C/D)
 
 Leave a blank line between each question. Output ONLY questions and answers."""
+
+# Direct Universal REST Call (Works with both AQ. and AIzaSy. keys)
+async def call_gemini_api(prompt, image_bytes=None):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    
+    parts = []
+    if image_bytes:
+        b64_data = base64.b64encode(image_bytes).decode('utf-8')
+        parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": b64_data
+            }
+        })
+    parts.append({"text": prompt})
+    
+    payload = {
+        "contents": [{"parts": parts}]
+    }
+    
+    async with ClientSession() as session:
+        async with session.post(url, json=payload, headers={"Content-Type": "application/json"}) as resp:
+            if resp.status != 200:
+                err_body = await resp.text()
+                raise Exception(f"API Error ({resp.status}): {err_body[:100]}")
+            data = await resp.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
 
 def parse_questions(text):
     out = []
@@ -90,7 +112,6 @@ def generate_pdf_buffer(title, content_text):
 
     draw_header()
     y = height - 65
-    
     clean_text = content_text.replace("**", "").replace("##", "").replace("*", "•")
     lines = clean_text.split("\n")
     
@@ -163,8 +184,8 @@ Include:
 Language: Clear English and Hindi readable format."""
 
     try:
-        response = await asyncio.to_thread(ai_model.generate_content, prompt)
-        pdf_file = await asyncio.to_thread(generate_pdf_buffer, topic_name, response.text)
+        raw_text = await call_gemini_api(prompt)
+        pdf_file = await asyncio.to_thread(generate_pdf_buffer, topic_name, raw_text)
         clean_name = re.sub(r'[^a-zA-Z0-9]', '_', topic_name)
         pdf_file.name = f"{clean_name}_Notes.pdf"
         
@@ -176,7 +197,7 @@ Language: Clear English and Hindi readable format."""
         )
         await msg.delete()
     except Exception as e:
-        await msg.edit_text(f"⚠️ PDF generate nahi ho saki: {str(e)[:100]}")
+        await msg.edit_text(f"⚠️ PDF generate nahi ho saki: {str(e)[:120]}")
 
 async def create_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -232,21 +253,16 @@ async def process_image_bytes(p_bytes, msg, uid):
         pil_img.save(img_byte_arr, format='JPEG', quality=85)
         raw_bytes = img_byte_arr.getvalue()
         
-        image_part = {
-            "mime_type": "image/jpeg",
-            "data": raw_bytes
-        }
-        
-        response = await asyncio.to_thread(ai_model.generate_content, [AI_OCR_PROMPT, image_part])
-        qs = parse_questions(response.text)
+        res_text = await call_gemini_api(AI_OCR_PROMPT, image_bytes=raw_bytes)
+        qs = parse_questions(res_text)
         
         if qs:
             creation_state[uid]["questions"].extend(qs)
             await msg.edit_text(f"✅ AI ne is page se **{len(qs)} Questions** banaye!\nTotal Questions: **{len(creation_state[uid]['questions'])}**\n\nAur photos bhejein ya complete karne ke liye `/done` bhejein.")
         else:
-            await msg.edit_text("⚠️ Image saaf nahi aayi ya questions extract nahi ho sake. Dusri clear photo bhejein.")
+            await msg.edit_text("⚠️ Image saaf nahi aayi ya questions extract nahi ho sake. Clear photo bhejein.")
     except Exception as e:
-        await msg.edit_text(f"⚠️ Scan error: {str(e)[:100]}. Kripya saaf photo upload karein.")
+        await msg.edit_text(f"⚠️ Scan error: {str(e)[:120]}.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -435,31 +451,6 @@ async def keep_alive():
             pass
         await asyncio.sleep(300)
 
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("create_quiz", create_quiz_cmd))
-    app.add_handler(CommandHandler("done", finalize_quiz))
-    app.add_handler(CommandHandler("store", store_cmd))
-    app.add_handler(CommandHandler("stop", stop_quiz_cmd))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(PollAnswerHandler(handle_answer))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-    app.add_handler(MessageHandler(filters.TEXT, handle_text))
-
-    server = web.Application()
-    server.router.add_get("/", handle_http)
-    runner = web.AppRunner(server)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080))).start()
-    asyncio.create_task(keep_alive())
-    print("Bot Live...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    while True:
-        await asyncio.sleep(3600)
-
 if __name__ == "__main__":
     asyncio.run(main())
+    
