@@ -56,80 +56,85 @@ Answer: Correct Option Letter (A/B/C/D)
 
 Leave a blank line between each question. Output ONLY questions and answers."""
 
-async def generate_ai_text(prompt, image_bytes=None):
+async def generate_ai_text(prompt, image_bytes=None, use_web=False):
+    """Generate text with Groq or Gemini.
+
+    - Groq text/current-affairs: current supported models.
+    - Groq image OCR: qwen/qwen3.6-27b (multimodal).
+    - Gemini fallback: gemini-2.5-flash (stable multimodal).
+    """
+    timeout = 90
+
     if API_KEY.startswith("gsk_"):
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-        
+
         if image_bytes:
-            b64_img = base64.b64encode(image_bytes).decode('utf-8')
-            models_to_try = [
-                "llama-3.2-11b-vision-preview",
-                "llama-3.2-90b-vision-preview"
-            ]
-            last_err = ""
-            for model in models_to_try:
-                payload = {
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                            ]
-                        }
+            b64_img = base64.b64encode(image_bytes).decode("utf-8")
+            payload = {
+                "model": "qwen/qwen3.6-27b",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
                     ],
-                    "temperature": 0.3
-                }
-                async with ClientSession() as session:
-                    async with session.post(url, json=payload, headers=headers) as resp:
-                        data = await resp.json()
-                        if resp.status == 200:
-                            return data["choices"][0]["message"]["content"]
-                        else:
-                            last_err = str(data)
-                            continue
-            raise Exception(f"Vision Scan Error: {last_err[:120]}")
+                }],
+                "temperature": 0.2,
+                "max_completion_tokens": 5000,
+            }
         else:
-            models_to_try = [
-                "llama-3.3-70b-versatile",
-                "llama-3.1-8b-instant"
-            ]
-            last_err = ""
-            for model in models_to_try:
-                payload = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3
-                }
-                async with ClientSession() as session:
-                    async with session.post(url, json=payload, headers=headers) as resp:
-                        data = await resp.json()
-                        if resp.status == 200:
-                            return data["choices"][0]["message"]["content"]
-                        else:
-                            last_err = str(data)
-                            continue
-            raise Exception(f"Groq API Error: {last_err[:120]}")
-    else:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
-        parts = []
-        if image_bytes:
-            b64_data = base64.b64encode(image_bytes).decode('utf-8')
-            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64_data}})
-        parts.append({"text": prompt})
-        
-        async with ClientSession() as session:
-            async with session.post(url, json={"contents": [{"parts": parts}]}, headers={"Content-Type": "application/json"}) as resp:
-                data = await resp.json()
-                if resp.status == 200:
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                else:
-                    raise Exception(f"Gemini API Error: {str(data)[:100]}")
+            payload = {
+                "model": "groq/compound" if use_web else "openai/gpt-oss-120b",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+            }
+
+        client_timeout = __import__("aiohttp").ClientTimeout(total=timeout)
+        async with ClientSession(timeout=client_timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                raw = await resp.text()
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {"raw": raw}
+                if resp.status != 200:
+                    raise Exception(f"Groq HTTP {resp.status}: {str(data)[:300]}")
+                try:
+                    return data["choices"][0]["message"]["content"]
+                except Exception:
+                    raise Exception(f"Groq response format error: {str(data)[:300]}")
+
+    # Gemini API key fallback
+    model = "gemini-2.5-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={API_KEY}"
+    parts = []
+    if image_bytes:
+        b64_data = base64.b64encode(image_bytes).decode("utf-8")
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64_data}})
+    parts.append({"text": prompt})
+
+    client_timeout = __import__("aiohttp").ClientTimeout(total=timeout)
+    async with ClientSession(timeout=client_timeout) as session:
+        async with session.post(
+            url,
+            json={"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.2}},
+            headers={"Content-Type": "application/json"},
+        ) as resp:
+            raw = await resp.text()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = {"raw": raw}
+            if resp.status != 200:
+                raise Exception(f"Gemini HTTP {resp.status}: {str(data)[:300]}")
+            try:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except Exception:
+                raise Exception(f"Gemini response format error: {str(data)[:300]}")
 
 def create_welcome_audio():
     buf = io.BytesIO()
@@ -187,7 +192,7 @@ def generate_pdf_buffer(title, content_text):
     draw_header()
     y = height - 65
     clean_text = content_text.replace("**", "").replace("##", "").replace("*", "-")
-    clean_text = re.sub(r'[^\x00-\x7F]+', ' ', clean_text)
+    clean_text = clean_text.encode('ascii', errors='ignore').decode('ascii')
     lines = clean_text.split("\n")
     
     for line in lines:
@@ -206,9 +211,12 @@ def generate_pdf_buffer(title, content_text):
 
 def get_main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Create Quiz (Photo to Quiz)", callback_data="menu_create")],
-        [InlineKeyboardButton("🔍 Search / Fact Check Question", callback_data="menu_search")],
-        [InlineKeyboardButton("📚 Quiz Store", callback_data="menu_store")],
+        [InlineKeyboardButton("📸 Photo → Objective Quiz", callback_data="menu_photo")],
+        [InlineKeyboardButton("➕ Create Custom Quiz", callback_data="menu_create")],
+        [InlineKeyboardButton("🔍 Search / Current Affairs", callback_data="menu_search")],
+        [InlineKeyboardButton("📘 Static GK", callback_data="topic_static_gk"), InlineKeyboardButton("📰 Current Affairs", callback_data="topic_current_affairs")],
+        [InlineKeyboardButton("📚 Lucent / Saar Sangrah Scan", callback_data="menu_bookscan")],
+        [InlineKeyboardButton("🛒 Quiz Store", callback_data="menu_store")],
         [InlineKeyboardButton("🛑 Stop Running Quiz", callback_data="menu_stop")]
     ])
 
@@ -227,7 +235,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    text = "👋 **Welcome to Dulhin Bazar Study & Quiz Bot**\n\n📄 **Instant PDF Notes:** Chat me kisi bhi subject/chapter ka naam likhein.\n🔍 **Question Doubt/Search:** `/search <question>` likhein ya button dabayein.\n🎲 **Quiz Features:** Neeche diye buttons use karein."
+    text = "👋 **Welcome to Dulhin Bazar Study & Quiz Bot**\n\n📄 **Topic Notes/PDF:** kisi bhi subject ya topic ka naam bhejein.\n📸 **Photo to Quiz:** direct clear photo bhej sakte hain.\n🔍 **Search/Current Affairs:** button ya `/search <question>` use karein.\n📚 **Lucent/Saar Sangrah:** apne pages scan karke objective MCQs bana sakte hain."
     if update.message:
         await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
     elif update.callback_query:
@@ -260,7 +268,7 @@ Provide a crisp, 100% correct answer:
 Language: Clear English and Hindi readable."""
 
     try:
-        ai_reply = await generate_ai_text(prompt)
+        ai_reply = await generate_ai_text(prompt, use_web=True)
         await status_msg.edit_text(f"🎯 **Verified Answer:**\n\n{ai_reply}", parse_mode="Markdown")
     except Exception as e:
         await status_msg.edit_text(f"⚠️ Search Error: {str(e)[:120]}")
@@ -296,7 +304,7 @@ Include:
 1. Core Concepts & Chronology / Key Facts
 2. Important Exam Points (Bullet format)
 3. 10 Most Expected Multiple Choice Questions with Answers at the end.
-Language: English & simple Hinglish terms."""
+Language: Roman Hindi + simple English only. Devanagari script mat use karo, taaki PDF har server par sahi render ho."""
 
     try:
         raw_text = await generate_ai_text(prompt)
@@ -373,7 +381,7 @@ async def process_image_bytes(p_bytes, msg, uid):
         
         if qs:
             creation_state[uid]["questions"].extend(qs)
-            await msg.edit_text(f"✅ AI ne is page se **{len(qs)} Questions** banaye!\nTotal Questions: **{len(creation_state[uid]['questions'])}**\n\nAur photos bhejein ya complete karne ke liye `/done` bhejein.")
+            await msg.edit_text(f"✅ AI ne is page se **{len(qs)} Questions** banaye!\nTotal Questions: **{len(creation_state[uid]['questions'])}**\n\nAur photos bhejein ya quiz save/start karne ke liye `/done` bhejein.")
         else:
             await msg.edit_text("⚠️ Questions extract nahi ho sake. Clear photo bhejein.")
     except Exception as e:
@@ -381,9 +389,23 @@ async def process_image_bytes(p_bytes, msg, uid):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in creation_state or creation_state[uid]["step"] != "QUESTIONS":
+
+    # Direct photo -> quiz mode. User ko create flow start karna zaroori nahi.
+    if uid not in creation_state:
+        creation_state[uid] = {
+            "title": "Photo Scan Quiz",
+            "subject": "Scanned Notes",
+            "price": 0,
+            "timer": 15,
+            "questions": [],
+            "step": "QUESTIONS",
+            "auto_photo": True,
+        }
+    elif creation_state[uid].get("step") != "QUESTIONS":
+        await update.message.reply_text("⚠️ Abhi quiz setup chal raha hai. Pehle current step complete karein ya /cancel bhejein.")
         return
-    msg = await update.message.reply_text("🔍 AI Deep Page Scan chal raha hai (3-5 sec)...")
+
+    msg = await update.message.reply_text("🔍 AI photo scan karke objective MCQs bana raha hai...")
     f = await (await context.bot.get_file(update.message.photo[-1].file_id)).download_as_bytearray()
     await process_image_bytes(f, msg, uid)
 
@@ -441,6 +463,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["questions"].extend(qs)
             await update.message.reply_text(f"✅ {len(qs)} Qs add hue! Total: {len(st['questions'])}\nSave karne ke liye `/done` likhein.")
 
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    creation_state.pop(uid, None)
+    search_state.pop(uid, None)
+    await update.message.reply_text("✅ Current setup cancel ho gaya.", reply_markup=get_main_keyboard())
+
 async def store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.get("quizzes"):
         msg = "📂 Store khali hai. Pehle `/create_quiz` karein."
@@ -461,6 +490,27 @@ async def store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
+
+async def send_topic_notes(topic_name, target_message, context: ContextTypes.DEFAULT_TYPE, use_web=False):
+    status = await target_message.reply_text(f"🤖 {topic_name} ke exam notes bana raha hoon...")
+    prompt = f"""You are an exam-preparation assistant for Indian competitive exams.
+Topic: {topic_name}
+Give high-yield notes in Roman Hindi + simple English.
+Include: key facts, dates if relevant, one-line revision points, and 10 objective MCQs with answers.
+If this is current affairs, use only fresh verifiable information and mention exact dates.
+Do not claim that this is verbatim content from any copyrighted commercial book."""
+    try:
+        text = await generate_ai_text(prompt, use_web=use_web)
+        # Telegram message limit handling
+        if len(text) <= 3900:
+            await status.edit_text(text)
+        else:
+            await status.edit_text(text[:3900])
+            for i in range(3900, len(text), 3900):
+                await target_message.reply_text(text[i:i+3900])
+    except Exception as e:
+        await status.edit_text(f"⚠️ AI Error: {str(e)[:250]}")
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -470,9 +520,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if d == "menu_main":
         await q.edit_message_text("👋 **Dulhin Bazar Quiz & Study Menu:**", reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    elif d == "menu_photo":
+        creation_state[uid] = {"title": "Photo Scan Quiz", "subject": "Scanned Notes", "price": 0, "timer": 15, "questions": [], "step": "QUESTIONS", "auto_photo": True}
+        await q.edit_message_text("📸 Ab book/notes ka clear PHOTO bhejo. Main usse objective MCQs bana dunga. Multiple photos bhej sakte ho; end me /done bhejo.")
+    elif d == "menu_bookscan":
+        creation_state[uid] = {"title": "Book Scan Quiz", "subject": "Book Scan", "price": 0, "timer": 15, "questions": [], "step": "QUESTIONS", "auto_photo": True}
+        await q.edit_message_text("📚 Lucent 2026, Saar Sangrah ya kisi bhi apni book/notes ke pages ka PHOTO bhejo. Main sirf tumhare bheje hue pages ko scan karke MCQs banaunga. End me /done bhejo.")
+    elif d == "topic_static_gk":
+        await q.edit_message_text("📘 Static GK generate ho raha hai...")
+        await send_topic_notes("Static GK for SSC/Railway/Police exams", q.message, context, use_web=False)
+    elif d == "topic_current_affairs":
+        await q.edit_message_text("📰 Latest Current Affairs web se verify ho raha hai...")
+        await send_topic_notes("Latest India and World Current Affairs", q.message, context, use_web=True)
     elif d == "menu_search":
         search_state[uid] = True
-        await q.edit_message_text("🔍 **Question Doubt / Fact-Check:**\n\nApna question/doubt chat me paste karein. AI turant verify karke sahi answer dega.")
+        await q.edit_message_text("🔍 **Question Doubt / Fact-Check:**\n\nAb apna question/doubt next message me paste karein. Current affairs ho to AI web se latest info check karega.", parse_mode="Markdown")
     elif d == "menu_create":
         creation_state[uid] = {"title": "", "subject": "General", "price": 0, "timer": 15, "questions": [], "step": "TITLE"}
         await q.edit_message_text("📝 Quiz ka **Title / Naam** likh kar bhejein:")
@@ -590,6 +652,15 @@ async def keep_alive():
             pass
         await asyncio.sleep(300)
 
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print("Telegram error:", repr(context.error))
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(update.effective_chat.id, f"⚠️ Internal error: {type(context.error).__name__}. Render logs check karein.")
+    except Exception:
+        pass
+
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -598,11 +669,13 @@ async def main():
     app.add_handler(CommandHandler("done", finalize_quiz))
     app.add_handler(CommandHandler("store", store_cmd))
     app.add_handler(CommandHandler("stop", stop_quiz_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(PollAnswerHandler(handle_answer))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-    app.add_handler(MessageHandler(filters.TEXT, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(error_handler)
 
     server = web.Application()
     server.router.add_get("/", handle_http)
