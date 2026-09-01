@@ -9,10 +9,14 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 
-TOKEN = os.environ.get("BOT_TOKEN", "8736461994:AAEaIf5GPkN5Wri9Kb5hxCXwszvmIWlm3e4")
+# Pure Environment Variables (No Hardcoded Tokens)
+TOKEN = os.environ.get("BOT_TOKEN")
 UPI_ID = os.environ.get("UPI_ID", "marufhussain318-2@oksbi")
-GEMINI_KEY = os.environ.get("GEMINI_KEY", "AQ.Ab8RN6JacArVio7NBYlubfksQK8a9q9G2u4UyCzvJKqT56nF0Q")
+GEMINI_KEY = os.environ.get("GEMINI_KEY")
 DATA_FILE = "quiz_db.json"
+
+if not TOKEN or not GEMINI_KEY:
+    raise ValueError("BOT_TOKEN ya GEMINI_KEY set nahi hai! Render dashboard ke Environment tab par add karein.")
 
 genai.configure(api_key=GEMINI_KEY)
 ai_model = genai.GenerativeModel("gemini-1.5-flash")
@@ -159,7 +163,6 @@ Include:
 Language: Clear English and Hindi readable format."""
 
     try:
-        # Non-blocking AI Generation
         response = await asyncio.to_thread(ai_model.generate_content, prompt)
         pdf_file = await asyncio.to_thread(generate_pdf_buffer, topic_name, response.text)
         clean_name = re.sub(r'[^a-zA-Z0-9]', '_', topic_name)
@@ -277,7 +280,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_quiz_card(update.effective_chat.id, qid, uid, context)
         return
 
-    # PDF Generator Check (When user is not creating quiz)
     if uid not in creation_state:
         if text.startswith("/"):
             return
