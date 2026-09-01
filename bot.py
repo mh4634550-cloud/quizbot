@@ -3,6 +3,7 @@ from aiohttp import web, ClientSession
 from PIL import Image
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, PollAnswerHandler, ContextTypes, filters
+from gtts import gTTS
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -40,6 +41,7 @@ def save_data():
 db = load_data()
 creation_state = {}
 active_sessions = {}
+search_state = {}
 
 AI_OCR_PROMPT = """Read this book page very carefully. Extract EVERY single historical fact, date, king name, event, battle, book, reform, and list item.
 Convert all information into Multiple Choice Questions (MCQs) in Hindi/Hinglish.
@@ -79,9 +81,9 @@ async def generate_ai_text(prompt, image_bytes=None):
             }
         else:
             payload = {
-                "model": "llama3-70b-8192",
+                "model": "llama-3.1-8b-instant",
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.4
+                "temperature": 0.3
             }
 
         async with ClientSession() as session:
@@ -106,6 +108,24 @@ async def generate_ai_text(prompt, image_bytes=None):
                     return data["candidates"][0]["content"]["parts"][0]["text"]
                 else:
                     raise Exception(f"Gemini API Error: {str(data)[:100]}")
+
+def create_welcome_audio():
+    buf = io.BytesIO()
+    tts = gTTS(text="Hi, I am Maruf Hussain. Welcome to my bot!", lang='en', tld='co.in', slow=False)
+    tts.write_to_fp(buf)
+    buf.seek(0)
+    buf.name = "welcome.mp3"
+    return buf
+
+def create_winner_audio(winner_name):
+    buf = io.BytesIO()
+    clean_name = re.sub(r'[^a-zA-Z0-9 ]', '', winner_name).strip() or "Champion"
+    tts_text = f"Congratulations {clean_name}! You are the top winner of this quiz!"
+    tts = gTTS(text=tts_text, lang='en', tld='co.in', slow=False)
+    tts.write_to_fp(buf)
+    buf.seek(0)
+    buf.name = "winner.mp3"
+    return buf
 
 def parse_questions(text):
     out = []
@@ -163,23 +183,63 @@ def generate_pdf_buffer(title, content_text):
 def get_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Create Quiz (Photo to Quiz)", callback_data="menu_create")],
+        [InlineKeyboardButton("🔍 Search / Fact Check Question", callback_data="menu_search")],
         [InlineKeyboardButton("📚 Quiz Store", callback_data="menu_store")],
         [InlineKeyboardButton("🛑 Stop Running Quiz", callback_data="menu_stop")]
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     if context.args:
         arg = context.args[0]
         if arg.startswith("quiz_"):
             qid = arg.replace("quiz_", "")
-            await show_quiz_card(update.effective_chat.id, qid, update.effective_user.id, context)
+            await show_quiz_card(chat_id, qid, update.effective_user.id, context)
             return
 
-    text = "👋 **Dulhin Bazar Study & Quiz Bot**\n\n📄 **Instant PDF Notes:** Chat me kisi bhi subject/chapter ka naam likhein.\n\n🎲 **Quiz Features:** Neeche diye buttons use karein."
+    try:
+        voice_fp = await asyncio.to_thread(create_welcome_audio)
+        await context.bot.send_voice(chat_id=chat_id, voice=voice_fp, caption="🎙️ *Maruf Hussain - Study Assistant*")
+    except Exception:
+        pass
+
+    text = "👋 **Welcome to Dulhin Bazar Study & Quiz Bot**\n\n📄 **Instant PDF Notes:** Chat me kisi bhi subject/chapter ka naam likhein.\n🔍 **Question Doubt/Search:** `/search <question>` likhein ya button dabayein.\n🎲 **Quiz Features:** Neeche diye buttons use karein."
     if update.message:
         await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
     elif update.callback_query:
         await update.callback_query.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    query_text = " ".join(context.args).strip() if context.args else ""
+    
+    if query_text:
+        await execute_search(query_text, update, context)
+    else:
+        search_state[uid] = True
+        msg = "🔍 **Question Fact-Check / AI Search**\n\nApna question ya doubt yahan chat me paste karein. AI uska 100% accurate answer aur reasoning dega:"
+        if update.message:
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        elif update.callback_query:
+            await update.callback_query.edit_message_text(msg, parse_mode="Markdown")
+
+async def execute_search(question_query, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = update.message if update.message else update.callback_query.message
+    status_msg = await target.reply_text("🔍 Fact-checking and finding accurate answer...", parse_mode="Markdown")
+    
+    prompt = f"""You are a strict, highly accurate exam fact-checker and knowledge engine.
+Question/Query: {question_query}
+
+Provide a crisp, 100% correct answer:
+1. Direct Correct Answer (Bold)
+2. Brief 2-3 line verified explanation/fact logic.
+Language: Hindi / Hinglish and English mix."""
+
+    try:
+        ai_reply = await generate_ai_text(prompt)
+        await status_msg.edit_text(f"🎯 **Verified Answer:**\n\n{ai_reply}", parse_mode="Markdown")
+    except Exception as e:
+        await status_msg.edit_text(f"⚠️ Search Error: {str(e)[:120]}")
 
 async def show_quiz_card(chat_id, qid, uid, context: ContextTypes.DEFAULT_TYPE):
     qz = db.get("quizzes", {}).get(qid)
@@ -327,6 +387,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_quiz_card(update.effective_chat.id, qid, uid, context)
         return
 
+    if search_state.get(uid):
+        del search_state[uid]
+        await execute_search(text, update, context)
+        return
+
     if uid not in creation_state:
         if text.startswith("/"):
             return
@@ -381,6 +446,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if d == "menu_main":
         await q.edit_message_text("👋 **Dulhin Bazar Quiz & Study Menu:**", reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    elif d == "menu_search":
+        search_state[uid] = True
+        await q.edit_message_text("🔍 **Question Doubt / Fact-Check:**\n\nApna question/doubt chat me paste karein. AI turant verify karke sahi answer dega.")
     elif d == "menu_create":
         creation_state[uid] = {"title": "", "subject": "General", "price": 0, "timer": 15, "questions": [], "step": "TITLE"}
         await q.edit_message_text("📝 Quiz ka **Title / Naam** likh kar bhejein:")
@@ -439,11 +507,28 @@ async def run_quiz(chat_id, context: ContextTypes.DEFAULT_TYPE):
             if not s.get("run"):
                 break
             await asyncio.sleep(1)
+            
     if s.get("run"):
+        sorted_users = sorted(s["stats"].values(), key=lambda x: x["c"], reverse=True)
         res = f"🏁 '*{s['quiz']['title']}*' Finished!\n\n🏆 **Leaderboard:**\n"
-        for r, u in enumerate(sorted(s["stats"].values(), key=lambda x: x["c"], reverse=True), 1):
+        for r, u in enumerate(sorted_users, 1):
             res += f"{r}. 👤 *{u['n']}*: ✅ {u['c']} | ❌ {u['w']}\n"
+            
         await context.bot.send_message(chat_id, res if s["stats"] else "🏁 Quiz Finished!", parse_mode="Markdown")
+        
+        # Winner Voice Announcement
+        if sorted_users:
+            winner = sorted_users[0]
+            try:
+                winner_voice = await asyncio.to_thread(create_winner_audio, winner['n'])
+                await context.bot.send_voice(
+                    chat_id=chat_id, 
+                    voice=winner_voice, 
+                    caption=f"🎉 *Winner Voice Note: Congratulations {winner['n']}!*"
+                )
+            except Exception:
+                pass
+                
         if chat_id in active_sessions:
             del active_sessions[chat_id]
 
@@ -485,6 +570,7 @@ async def keep_alive():
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("create_quiz", create_quiz_cmd))
     app.add_handler(CommandHandler("done", finalize_quiz))
     app.add_handler(CommandHandler("store", store_cmd))
