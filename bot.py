@@ -9,13 +9,10 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 
-TOKEN = os.environ.get("BOT_TOKEN")
+TOKEN = os.environ.get("BOT_TOKEN", "8736461994:AAEaIf5GPkN5Wri9Kb5hxCXwszvmIWlm3e4")
 UPI_ID = os.environ.get("UPI_ID", "marufhussain318-2@oksbi")
-GEMINI_KEY = os.environ.get("GEMINI_KEY")
+GEMINI_KEY = os.environ.get("GEMINI_KEY", "AQ.Ab8RN6JacArVio7NBYlubfksQK8a9q9G2u4UyCzvJKqT56nF0Q")
 DATA_FILE = "quiz_db.json"
-
-if not TOKEN or not GEMINI_KEY:
-    raise ValueError("BOT_TOKEN ya GEMINI_KEY set nahi hai!")
 
 genai.configure(api_key=GEMINI_KEY)
 ai_model = genai.GenerativeModel("gemini-1.5-flash")
@@ -40,22 +37,23 @@ db = load_data()
 creation_state = {}
 active_sessions = {}
 
-AI_OCR_PROMPT = """Read and scan this entire book page. Extract and convert EVERY single fact, sentence, bullet point, table, or concept into Multiple Choice Questions (MCQs).
-Do not miss any point.
+AI_OCR_PROMPT = """Read this book page very carefully. Extract EVERY single historical fact, date, king name, event, battle, book, reform, and list item.
+Convert all information into Multiple Choice Questions (MCQs) in Hindi/Hinglish.
 
-Strict Output Format:
-Q1. Question text
+Strict Format for each question:
+Q1. Question text here?
 A) Option 1
 B) Option 2
 C) Option 3
 D) Option 4
 Answer: Correct Option Letter (A/B/C/D)
 
-Leave a blank line between each question. Output ONLY questions."""
+Leave a blank line between each question. Output ONLY questions and answers."""
 
 def parse_questions(text):
     out = []
-    for b in re.split(r"\n\s*\n|(?=\n\s*(?:Q\s*\d+[\.\)]|\d+[\.\)]))", text):
+    blocks = re.split(r"\n\s*\n|(?=\n\s*(?:Q\s*\d+[\.\)]|\d+[\.\)]))", text)
+    for b in blocks:
         lines = [l.strip() for l in b.split("\n") if l.strip()]
         if len(lines) < 3:
             continue
@@ -80,7 +78,7 @@ def generate_pdf_buffer(title, content_text):
     
     def draw_header():
         c.setFont("Helvetica-Bold", 14)
-        c.drawString(40, height - 40, f"Dulhin Bazar Notes: {title[:45]}")
+        c.drawString(40, height - 40, f"Dulhin Bazar Notes: {title[:40]}")
         c.setStrokeColor(colors.HexColor("#0088cc"))
         c.setLineWidth(1.5)
         c.line(40, height - 45, width - 40, height - 45)
@@ -121,7 +119,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_quiz_card(update.effective_chat.id, qid, update.effective_user.id, context)
             return
 
-    text = "👋 **Dulhin Bazar Study & Quiz Bot**\n\n📄 **Instant PDF Notes:** Chat mein kisi bhi subject ya chapter ka naam direct likhein (e.g. `Akbar Mughal kal`, `Bharat ka Bhugol`, `Science Physics`).\n\n🎲 **Quiz Features:** Neeche diye gaye buttons use karein."
+    text = "👋 **Dulhin Bazar Study & Quiz Bot**\n\n📄 **Instant PDF Notes:** Chat mein kisi bhi subject/chapter ka naam direct likhein (e.g. `Akbar`, `Bharat ka Samvidhan`, `Biology`).\n\n🎲 **Quiz Features:** Neeche diye gaye buttons use karein."
     if update.message:
         await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
     elif update.callback_query:
@@ -161,8 +159,9 @@ Include:
 Language: Clear English and Hindi readable format."""
 
     try:
-        res = ai_model.generate_content(prompt).text
-        pdf_file = generate_pdf_buffer(topic_name, res)
+        # Non-blocking AI Generation
+        response = await asyncio.to_thread(ai_model.generate_content, prompt)
+        pdf_file = await asyncio.to_thread(generate_pdf_buffer, topic_name, response.text)
         clean_name = re.sub(r'[^a-zA-Z0-9]', '_', topic_name)
         pdf_file.name = f"{clean_name}_Notes.pdf"
         
@@ -173,8 +172,8 @@ Language: Clear English and Hindi readable format."""
             parse_mode="Markdown"
         )
         await msg.delete()
-    except Exception:
-        await msg.edit_text("⚠️ PDF banane mein dikkat aayi. Kripya dobara topic ka naam bhejein.")
+    except Exception as e:
+        await msg.edit_text(f"⚠️ PDF generate nahi ho saki: {str(e)[:100]}")
 
 async def create_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -223,24 +222,34 @@ async def finalize_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_image_bytes(p_bytes, msg, uid):
     try:
-        raw_img = Image.open(io.BytesIO(p_bytes)).convert("RGB")
-        raw_img.thumbnail((1600, 1600))
+        pil_img = Image.open(io.BytesIO(p_bytes)).convert("RGB")
+        pil_img.thumbnail((2048, 2048))
         
-        res = ai_model.generate_content([AI_OCR_PROMPT, raw_img]).text
-        qs = parse_questions(res)
+        img_byte_arr = io.BytesIO()
+        pil_img.save(img_byte_arr, format='JPEG', quality=85)
+        raw_bytes = img_byte_arr.getvalue()
+        
+        image_part = {
+            "mime_type": "image/jpeg",
+            "data": raw_bytes
+        }
+        
+        response = await asyncio.to_thread(ai_model.generate_content, [AI_OCR_PROMPT, image_part])
+        qs = parse_questions(response.text)
+        
         if qs:
             creation_state[uid]["questions"].extend(qs)
-            await msg.edit_text(f"✅ AI ne is page se **{len(qs)} Questions** banaye!\nTotal Questions: **{len(creation_state[uid]['questions'])}**\n\nAur photos bhejein ya save karne ke liye `/done` bhejein.")
+            await msg.edit_text(f"✅ AI ne is page se **{len(qs)} Questions** banaye!\nTotal Questions: **{len(creation_state[uid]['questions'])}**\n\nAur photos bhejein ya complete karne ke liye `/done` bhejein.")
         else:
-            await msg.edit_text("⚠️ Image saaf nahi aayi ya questions nahi mile. Kripya page ki seedhi aur clear photo bhejein.")
-    except Exception:
-        await msg.edit_text("⚠️ OCR Scan mein issue aaya. Kripya image dobara upload karein.")
+            await msg.edit_text("⚠️ Image saaf nahi aayi ya questions extract nahi ho sake. Dusri clear photo bhejein.")
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Scan error: {str(e)[:100]}. Kripya saaf photo upload karein.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in creation_state or creation_state[uid]["step"] != "QUESTIONS":
         return
-    msg = await update.message.reply_text("🔍 AI Page Scan chal raha hai (5-8 sec)...")
+    msg = await update.message.reply_text("🔍 AI Deep Page Scan chal raha hai (5-8 sec)...")
     f = await (await context.bot.get_file(update.message.photo[-1].file_id)).download_as_bytearray()
     await process_image_bytes(f, msg, uid)
 
@@ -251,7 +260,7 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     f = await (await context.bot.get_file(doc.file_id)).download_as_bytearray()
     if (doc.mime_type and doc.mime_type.startswith("image/")) or doc.file_name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-        msg = await update.message.reply_text("🔍 AI Page Scan chal raha hai...")
+        msg = await update.message.reply_text("🔍 AI Deep Page Scan chal raha hai...")
         await process_image_bytes(f, msg, uid)
     else:
         qs = parse_questions(f.decode("utf-8", errors="ignore"))
@@ -268,10 +277,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_quiz_card(update.effective_chat.id, qid, uid, context)
         return
 
+    # PDF Generator Check (When user is not creating quiz)
     if uid not in creation_state:
-        clean_topic = re.sub(r"^/pdf\s*|^/|^pdf\s*", "", text, flags=re.IGNORECASE).strip()
-        if len(clean_topic) >= 2:
-            await handle_pdf_request(clean_topic, update, context)
+        if text.startswith("/"):
+            return
+        await handle_pdf_request(text, update, context)
         return
 
     st = creation_state[uid]
