@@ -66,33 +66,57 @@ async def generate_ai_text(prompt, image_bytes=None):
         
         if image_bytes:
             b64_img = base64.b64encode(image_bytes).decode('utf-8')
-            payload = {
-                "model": "llama-3.2-11b-vision-preview",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                        ]
-                    }
-                ],
-                "temperature": 0.3
-            }
+            models_to_try = [
+                "llama-3.2-11b-vision-preview",
+                "llama-3.2-90b-vision-preview"
+            ]
+            last_err = ""
+            for model in models_to_try:
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                            ]
+                        }
+                    ],
+                    "temperature": 0.3
+                }
+                async with ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers) as resp:
+                        data = await resp.json()
+                        if resp.status == 200:
+                            return data["choices"][0]["message"]["content"]
+                        else:
+                            last_err = str(data)
+                            continue
+            raise Exception(f"Vision Scan Error: {last_err[:120]}")
         else:
-            payload = {
-                "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3
-            }
-
-        async with ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers) as resp:
-                data = await resp.json()
-                if resp.status == 200:
-                    return data["choices"][0]["message"]["content"]
-                else:
-                    raise Exception(f"Groq API Error: {str(data)[:100]}")
+            models_to_try = [
+                "gemma2-9b-it",
+                "llama-3.3-70b-versatile",
+                "llama-3.1-70b-versatile",
+                "mixtral-8x7b-32768"
+            ]
+            last_err = ""
+            for model in models_to_try:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3
+                }
+                async with ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers) as resp:
+                        data = await resp.json()
+                        if resp.status == 200:
+                            return data["choices"][0]["message"]["content"]
+                        else:
+                            last_err = str(data)
+                            continue
+            raise Exception(f"Groq API Error: {last_err[:120]}")
     else:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
         parts = []
@@ -516,7 +540,6 @@ async def run_quiz(chat_id, context: ContextTypes.DEFAULT_TYPE):
             
         await context.bot.send_message(chat_id, res if s["stats"] else "🏁 Quiz Finished!", parse_mode="Markdown")
         
-        # Winner Voice Announcement
         if sorted_users:
             winner = sorted_users[0]
             try:
