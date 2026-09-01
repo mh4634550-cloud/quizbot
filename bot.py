@@ -10,11 +10,17 @@ from reportlab.lib import colors
 
 TOKEN = os.environ.get("BOT_TOKEN")
 UPI_ID = os.environ.get("UPI_ID", "marufhussain318-2@oksbi")
-GEMINI_KEY = os.environ.get("GEMINI_KEY")
+
+# Render environment variable auto-detect
+API_KEY = (
+    os.environ.get("GroqCloud") 
+    or os.environ.get("GEMINI_KEY") 
+    or os.environ.get("GROQ_API_KEY")
+)
 DATA_FILE = "quiz_db.json"
 
-if not TOKEN or not GEMINI_KEY:
-    raise ValueError("BOT_TOKEN ya GEMINI_KEY set nahi hai!")
+if not TOKEN or not API_KEY:
+    raise ValueError("BOT_TOKEN ya API Key environment variable me set nahi hai!")
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -49,43 +55,58 @@ Answer: Correct Option Letter (A/B/C/D)
 
 Leave a blank line between each question. Output ONLY questions and answers."""
 
-# Auto fallback across multiple endpoints & models
-async def call_gemini_api(prompt, image_bytes=None):
-    endpoints = [
-        ("v1beta", "gemini-1.5-flash"),
-        ("v1", "gemini-1.5-flash"),
-        ("v1beta", "gemini-1.5-pro"),
-        ("v1beta", "gemini-pro"),
-    ]
-    
-    parts = []
-    if image_bytes:
-        b64_data = base64.b64encode(image_bytes).decode('utf-8')
-        parts.append({
-            "inline_data": {
-                "mime_type": "image/jpeg",
-                "data": b64_data
+async def generate_ai_text(prompt, image_bytes=None):
+    if API_KEY.startswith("gsk_"):
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        if image_bytes:
+            b64_img = base64.b64encode(image_bytes).decode('utf-8')
+            payload = {
+                "model": "llama-3.2-11b-vision-preview",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                        ]
+                    }
+                ],
+                "temperature": 0.3
             }
-        })
-    parts.append({"text": prompt})
-    payload = {"contents": [{"parts": parts}]}
-    
-    last_err = ""
-    async with ClientSession() as session:
-        for ver, mod in endpoints:
-            url = f"https://generativelanguage.googleapis.com/{ver}/models/{mod}:generateContent?key={GEMINI_KEY}"
-            try:
-                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data["candidates"][0]["content"]["parts"][0]["text"]
-                    else:
-                        last_err = await resp.text()
-            except Exception as e:
-                last_err = str(e)
-                continue
-                
-    raise Exception(f"AI Connection Failed: {last_err[:120]}")
+        else:
+            payload = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.4
+            }
+
+        async with ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                data = await resp.json()
+                if resp.status == 200:
+                    return data["choices"][0]["message"]["content"]
+                else:
+                    raise Exception(f"Groq API Error: {str(data)[:100]}")
+    else:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+        parts = []
+        if image_bytes:
+            b64_data = base64.b64encode(image_bytes).decode('utf-8')
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64_data}})
+        parts.append({"text": prompt})
+        
+        async with ClientSession() as session:
+            async with session.post(url, json={"contents": [{"parts": parts}]}, headers={"Content-Type": "application/json"}) as resp:
+                data = await resp.json()
+                if resp.status == 200:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    raise Exception(f"Gemini API Error: {str(data)[:100]}")
 
 def parse_questions(text):
     out = []
@@ -155,7 +176,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_quiz_card(update.effective_chat.id, qid, update.effective_user.id, context)
             return
 
-    text = "👋 **Dulhin Bazar Study & Quiz Bot**\n\n📄 **Instant PDF Notes:** Chat mein kisi bhi subject/chapter ka naam direct likhein (e.g. `Akbar`, `Bharat ka Samvidhan`, `Biology`).\n\n🎲 **Quiz Features:** Neeche diye gaye buttons use karein."
+    text = "👋 **Dulhin Bazar Study & Quiz Bot**\n\n📄 **Instant PDF Notes:** Chat me kisi bhi subject/chapter ka naam likhein.\n\n🎲 **Quiz Features:** Neeche diye buttons use karein."
     if update.message:
         await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
     elif update.callback_query:
@@ -164,7 +185,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_quiz_card(chat_id, qid, uid, context: ContextTypes.DEFAULT_TYPE):
     qz = db.get("quizzes", {}).get(qid)
     if not qz:
-        await context.bot.send_message(chat_id, "⚠️ Yeh Quiz mojood nahi hai.")
+        await context.bot.send_message(chat_id, "⚠️ Quiz nahi mila.")
         return
     bme = await context.bot.get_me()
     has = qz["price"] == 0 or qid in db.get("purchases", {}).get(str(uid), []) or qz.get("owner") == uid
@@ -186,7 +207,7 @@ async def show_quiz_card(chat_id, qid, uid, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id, card, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def handle_pdf_request(topic_name, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text(f"⏳ **Generating complete study notes PDF for:** `{topic_name}`...\n⏱ Time: ~5-8 seconds", parse_mode="Markdown")
+    msg = await update.message.reply_text(f"⏳ **Generating PDF for:** `{topic_name}`...\n⏱ Time: ~3-5 seconds", parse_mode="Markdown")
     prompt = f"""Write detailed, comprehensive, high-yield exam revision notes and 10 top MCQs on the topic: '{topic_name}'.
 Include:
 1. Core Concepts & Chronology / Key Facts
@@ -195,7 +216,7 @@ Include:
 Language: Clear English and Hindi readable format."""
 
     try:
-        raw_text = await call_gemini_api(prompt)
+        raw_text = await generate_ai_text(prompt)
         pdf_file = await asyncio.to_thread(generate_pdf_buffer, topic_name, raw_text)
         clean_name = re.sub(r'[^a-zA-Z0-9]', '_', topic_name)
         pdf_file.name = f"{clean_name}_Notes.pdf"
@@ -203,12 +224,12 @@ Language: Clear English and Hindi readable format."""
         await update.message.reply_document(
             document=pdf_file,
             filename=f"{clean_name}_Notes.pdf",
-            caption=f"📚 **Complete PDF Notes:** {topic_name}\n🚀 Generated by AI",
+            caption=f"📚 **Complete PDF Notes:** {topic_name}\n🚀 Generated by Dulhin Bazar Bot",
             parse_mode="Markdown"
         )
         await msg.delete()
     except Exception as e:
-        await msg.edit_text(f"⚠️ PDF generate nahi ho saki: {str(e)[:120]}")
+        await msg.edit_text(f"⚠️ PDF Error: {str(e)[:120]}")
 
 async def create_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -264,22 +285,22 @@ async def process_image_bytes(p_bytes, msg, uid):
         pil_img.save(img_byte_arr, format='JPEG', quality=85)
         raw_bytes = img_byte_arr.getvalue()
         
-        res_text = await call_gemini_api(AI_OCR_PROMPT, image_bytes=raw_bytes)
+        res_text = await generate_ai_text(AI_OCR_PROMPT, image_bytes=raw_bytes)
         qs = parse_questions(res_text)
         
         if qs:
             creation_state[uid]["questions"].extend(qs)
             await msg.edit_text(f"✅ AI ne is page se **{len(qs)} Questions** banaye!\nTotal Questions: **{len(creation_state[uid]['questions'])}**\n\nAur photos bhejein ya complete karne ke liye `/done` bhejein.")
         else:
-            await msg.edit_text("⚠️ Image saaf nahi aayi ya questions extract nahi ho sake. Clear photo bhejein.")
+            await msg.edit_text("⚠️ Questions extract nahi ho sake. Clear photo bhejein.")
     except Exception as e:
-        await msg.edit_text(f"⚠️ Scan error: {str(e)[:120]}.")
+        await msg.edit_text(f"⚠️ Scan error: {str(e)[:120]}")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in creation_state or creation_state[uid]["step"] != "QUESTIONS":
         return
-    msg = await update.message.reply_text("🔍 AI Deep Page Scan chal raha hai (5-8 sec)...")
+    msg = await update.message.reply_text("🔍 AI Deep Page Scan chal raha hai (3-5 sec)...")
     f = await (await context.bot.get_file(update.message.photo[-1].file_id)).download_as_bytearray()
     await process_image_bytes(f, msg, uid)
 
