@@ -96,10 +96,8 @@ async def generate_ai_text(prompt, image_bytes=None):
             raise Exception(f"Vision Scan Error: {last_err[:120]}")
         else:
             models_to_try = [
-                "gemma2-9b-it",
                 "llama-3.3-70b-versatile",
-                "llama-3.1-70b-versatile",
-                "mixtral-8x7b-32768"
+                "llama-3.1-8b-instant"
             ]
             last_err = ""
             for model in models_to_try:
@@ -135,7 +133,8 @@ async def generate_ai_text(prompt, image_bytes=None):
 
 def create_welcome_audio():
     buf = io.BytesIO()
-    tts = gTTS(text="Hi, I am Maruf Hussain. Welcome to my bot!", lang='en', tld='co.in', slow=False)
+    speech_text = "Hii! My name is Maruf. Kaise ho aap log? Aap logon ka swagat hai mere bot mein. Welcome to my quiz bot!"
+    tts = gTTS(text=speech_text, lang='hi', slow=False)
     tts.write_to_fp(buf)
     buf.seek(0)
     buf.name = "welcome.mp3"
@@ -187,11 +186,12 @@ def generate_pdf_buffer(title, content_text):
 
     draw_header()
     y = height - 65
-    clean_text = content_text.replace("**", "").replace("##", "").replace("*", "•")
+    clean_text = content_text.replace("**", "").replace("##", "").replace("*", "-")
+    clean_text = re.sub(r'[^\x00-\x7F]+', ' ', clean_text)
     lines = clean_text.split("\n")
     
     for line in lines:
-        wrapped_chunks = [line[i:i+90] for i in range(0, len(line), 90)] if line else [""]
+        wrapped_chunks = [line[i:i+85] for i in range(0, len(line), 85)] if line else [""]
         for chunk in wrapped_chunks:
             if y < 55:
                 c.showPage()
@@ -223,7 +223,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         voice_fp = await asyncio.to_thread(create_welcome_audio)
-        await context.bot.send_voice(chat_id=chat_id, voice=voice_fp, caption="🎙️ *Maruf Hussain - Study Assistant*")
+        await context.bot.send_voice(chat_id=chat_id, voice=voice_fp, caption="🤖 *Maruf Hussain - Quiz Assistant*")
     except Exception:
         pass
 
@@ -257,7 +257,7 @@ Question/Query: {question_query}
 Provide a crisp, 100% correct answer:
 1. Direct Correct Answer (Bold)
 2. Brief 2-3 line verified explanation/fact logic.
-Language: Hindi / Hinglish and English mix."""
+Language: Clear English and Hindi readable."""
 
     try:
         ai_reply = await generate_ai_text(prompt)
@@ -296,7 +296,7 @@ Include:
 1. Core Concepts & Chronology / Key Facts
 2. Important Exam Points (Bullet format)
 3. 10 Most Expected Multiple Choice Questions with Answers at the end.
-Language: Clear English and Hindi readable format."""
+Language: English & simple Hinglish terms."""
 
     try:
         raw_text = await generate_ai_text(prompt)
