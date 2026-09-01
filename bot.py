@@ -5,7 +5,7 @@ import google.generativeai as genai
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, PollAnswerHandler, ContextTypes, filters
 
-TOKEN = "8832779613:AAETBqawjr3YwH8Su6c_Qz5OuD-IuHiOsqc"
+TOKEN = "8736461994:AAHl06AxkYQmRudfV3r2AgLYQVlUV8mMoHU"
 UPI_ID = "marufhussain318-2@oksbi"
 GEMINI_KEY = "AQ.Ab8RN6JacArVio7NBYlubfksQK8a9q9G2u4UyCzvJKqT56nF0Q"
 DATA_FILE = "quiz_db.json"
