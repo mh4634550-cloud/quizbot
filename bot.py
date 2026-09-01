@@ -5,10 +5,18 @@ import google.generativeai as genai
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, PollAnswerHandler, ContextTypes, filters
 
-TOKEN = "8736461994:AAHl06AxkYQmRudfV3r2AgLYQVlUV8mMoHU"
-UPI_ID = "marufhussain318-2@oksbi"
-GEMINI_KEY = "AQ.Ab8RN6JacArVio7NBYlubfksQK8a9q9G2u4UyCzvJKqT56nF0Q"
+# ReportLab for on-the-fly PDF Generation
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+
+TOKEN = os.environ.get("BOT_TOKEN")
+UPI_ID = os.environ.get("UPI_ID", "marufhussain318-2@oksbi")
+GEMINI_KEY = os.environ.get("GEMINI_KEY")
 DATA_FILE = "quiz_db.json"
+
+if not TOKEN or not GEMINI_KEY:
+    raise ValueError("BOT_TOKEN ya GEMINI_KEY set nahi hai!")
 
 genai.configure(api_key=GEMINI_KEY)
 ai_model = genai.GenerativeModel("gemini-1.5-flash")
@@ -33,9 +41,10 @@ db = load_data()
 creation_state = {}
 active_sessions = {}
 
-AI_PROMPT = """Analyze this image thoroughly. Extract and generate MAXIMUM possible multiple-choice questions from EVERY single fact, sentence, bullet point, table, or line present on this book page.
+AI_OCR_PROMPT = """Read and scan this entire book page. Extract and convert EVERY single fact, sentence, bullet point, table, or concept into Multiple Choice Questions (MCQs).
+Do not miss any point.
 
-Format strictly as:
+Strict Output Format:
 Q1. Question text
 A) Option 1
 B) Option 2
@@ -43,7 +52,7 @@ C) Option 3
 D) Option 4
 Answer: Correct Option Letter (A/B/C/D)
 
-Leave a blank line between each question. Do not include introductory or closing remarks."""
+Leave a blank line between each question. Output ONLY questions."""
 
 def parse_questions(text):
     out = []
@@ -65,10 +74,42 @@ def parse_questions(text):
             out.append({"question": q_txt[:280], "options": opts[:4], "correct_id": min(c_idx, len(opts) - 1)})
     return out
 
+def generate_pdf_buffer(title, content_text):
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    width, height = letter
+    
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, height - 50, f"Dulhin Bazar Study Notes: {title[:40]}")
+    c.setStrokeColor(colors.gray)
+    c.line(50, height - 55, width - 50, height - 55)
+    
+    c.setFont("Helvetica", 10)
+    y = height - 80
+    lines = content_text.split("\n")
+    
+    for line in lines:
+        if y < 50:
+            c.showPage()
+            c.setFont("Helvetica", 10)
+            y = height - 50
+        # Simple wrap
+        while len(line) > 85:
+            c.drawString(50, y, line[:85])
+            line = line[85:]
+            y -= 14
+        c.drawString(50, y, line)
+        y -= 14
+        
+    c.save()
+    buf.seek(0)
+    return buf
+
 def get_main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Create Quiz", callback_data="menu_create")],
+        [InlineKeyboardButton("➕ Create Quiz (Photo to Quiz)", callback_data="menu_create")],
         [InlineKeyboardButton("📚 Quiz Store", callback_data="menu_store")],
+        [InlineKeyboardButton("📄 Instant PDF Generator", callback_data="menu_pdf_help")],
         [InlineKeyboardButton("🛑 Stop Running Quiz", callback_data="menu_stop")]
     ])
 
@@ -80,7 +121,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_quiz_card(update.effective_chat.id, qid, update.effective_user.id, context)
             return
 
-    text = "👋 **Welcome to Dulhin Bazar Quiz Bot!**\n\nNeeche diye gaye buttons par click karke bot use karein:"
+    text = "👋 **Welcome to Dulhin Bazar Quiz & Study Bot!**\n\n🔹 **Photo bhejein** $\rightarrow$ Direct Quiz banegi\n🔹 **Topic likhein** $\rightarrow$ 5-8 second mein complete PDF milegi"
     if update.message:
         await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
     elif update.callback_query:
@@ -96,7 +137,7 @@ async def show_quiz_card(chat_id, qid, uid, context: ContextTypes.DEFAULT_TYPE):
     price_tag = "FREE" if qz["price"] == 0 else f"₹{qz['price']}"
     card = f"🎲 '*{qz['title']}*'\n\n📁 Subject: *{qz['subject']}*\n✒️ Total: *{len(qz['questions'])} Qs*\n⏱ Timer: *{qz['timer']}s*\n💰 Price: *{price_tag}*"
     
-    share_url = f"https://t.me/share/url?url=https://t.me/{bme.username}?start=quiz_{qid}&text={urllib.parse.quote('Take this Quiz: ' + qz['title'])}"
+    share_url = f"https://t.me/share/url?url=https://t.me/{bme.username}?start=quiz_{qid}&text={urllib.parse.quote('Take Quiz: ' + qz['title'])}"
     group_url = f"https://t.me/{bme.username}?startgroup=quiz_{qid}"
     
     kb = []
@@ -110,19 +151,109 @@ async def show_quiz_card(chat_id, qid, uid, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(chat_id, card, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-async def create_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_pdf_request(topic_name, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text(f"⏳ **Generating complete study notes PDF for:** `{topic_name}`...\n⏱ Time: ~5-8 seconds")
+    prompt = f"""Write detailed, comprehensive, high-yield exam revision notes and 10 top MCQs on the topic: '{topic_name}'.
+Include:
+1. Core Concepts & Chronology / Key Facts
+2. Important Exam Points (Bullet format)
+3. 10 Most Expected Multiple Choice Questions with Answers at the end.
+Language: Clear Hinglish / English readable text."""
+
+    try:
+        res = ai_model.generate_content(prompt).text
+        pdf_file = generate_pdf_buffer(topic_name, res)
+        pdf_file.name = f"{re.sub(r'[^a-zA-Z0-9]', '_', topic_name)}_Notes.pdf"
+        
+        await update.message.reply_document(
+            document=pdf_file,
+            caption=f"📚 **Complete PDF Notes:** {topic_name}\n🚀 Powered by AI",
+            parse_mode="Markdown"
+        )
+        await msg.delete()
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Error creating PDF. Kripya dobara try karein.")
+
+async def process_image_bytes(p_bytes, msg, uid):
+    try:
+        img = Image.open(io.BytesIO(p_bytes)).convert("RGB")
+        res = ai_model.generate_content([AI_OCR_PROMPT, img]).text
+        qs = parse_questions(res)
+        if qs:
+            creation_state[uid]["questions"].extend(qs)
+            await msg.edit_text(f"✅ AI ne is page se **{len(qs)} Questions** banaye!\nTotal Questions: **{len(creation_state[uid]['questions'])}**\n\nAur photos bhejein ya save karne ke liye `/done` bhejein.")
+        else:
+            await msg.edit_text("⚠️ Image saaf nahi aayi. Clear photo upload karein.")
+    except Exception as e:
+        await msg.edit_text("⚠️ OCR Scan mein issue aaya. Clear angle se photo bhejein.")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    creation_state[uid] = {"title": "", "subject": "General", "price": 0, "timer": 15, "questions": [], "step": "TITLE"}
-    msg = "📝 Quiz ka **Title / Naam** likh kar bhejein:"
-    if update.message:
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(msg, parse_mode="Markdown")
+    if uid not in creation_state or creation_state[uid]["step"] != "QUESTIONS":
+        return
+    msg = await update.message.reply_text("🔍 Scanning page points via AI...")
+    f = await (await context.bot.get_file(update.message.photo[-1].file_id)).download_as_bytearray()
+    await process_image_bytes(f, msg, uid)
+
+async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in creation_state or creation_state[uid]["step"] != "QUESTIONS":
+        return
+    doc = update.message.document
+    f = await (await context.bot.get_file(doc.file_id)).download_as_bytearray()
+    if (doc.mime_type and doc.mime_type.startswith("image/")) or doc.file_name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        msg = await update.message.reply_text("🔍 Scanning image file via AI...")
+        await process_image_bytes(f, msg, uid)
+    else:
+        qs = parse_questions(f.decode("utf-8", errors="ignore"))
+        if qs:
+            creation_state[uid]["questions"].extend(qs)
+            await update.message.reply_text(f"📁 **{len(qs)} Qs** add hue! Total: {len(creation_state[uid]['questions'])}\nSave ke liye `/done` likhein.")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text = update.message.text.strip()
+    
+    # Check for direct PDF triggers
+    pdf_keywords = ["/pdf", "/history", "/ancient", "/modern", "/mughal", "/akbar", "/andolan", "/geography", "/science", "/polity", "/samvidhan", "/biology", "/physics", "/chemistry", "/currentaffairs"]
+    if any(text.lower().startswith(k) for k in pdf_keywords) or text.lower().startswith("pdf "):
+        topic = re.sub(r"^/[a-zA-Z0-9_]+\s*|^pdf\s*", "", text, flags=re.IGNORECASE).strip()
+        if not topic:
+            topic = text.replace("/", "")
+        await handle_pdf_request(topic, update, context)
+        return
+
+    if text.startswith("/start_quiz_"):
+        qid = text.replace("/start_quiz_", "")
+        await show_quiz_card(update.effective_chat.id, qid, uid, context)
+        return
+
+    if uid not in creation_state:
+        return
+
+    st = creation_state[uid]
+    if st["step"] == "TITLE":
+        st["title"] = text
+        st["step"] = "SUBJECT"
+        await update.message.reply_text(f"✅ Title: *{text}*\nAb **Subject** likhein:", parse_mode="Markdown")
+    elif st["step"] == "SUBJECT":
+        st["subject"] = text
+        st["step"] = "PRICE"
+        kb = [[InlineKeyboardButton("Free (₹0)", callback_data="p_0"), InlineKeyboardButton("₹21", callback_data="p_21")], [InlineKeyboardButton("₹49", callback_data="p_49")]]
+        await update.message.reply_text("💰 Price select karein:", reply_markup=InlineKeyboardMarkup(kb))
+    elif st["step"] == "QUESTIONS":
+        if text.lower() in ["/done", "done"]:
+            await finalize_quiz(update, context)
+            return
+        qs = parse_questions(text)
+        if qs:
+            st["questions"].extend(qs)
+            await update.message.reply_text(f"✅ {len(qs)} Qs add hue! Total: {len(st['questions'])}\nSave karne ke liye `/done` likhein.")
 
 async def finalize_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in creation_state or not creation_state[uid]["questions"]:
-        await update.message.reply_text("⚠️ Pehle book page ki photo ya text bhejein!")
+        await update.message.reply_text("⚠️ Pehle questions add karein!")
         return
     st = creation_state[uid]
     qid = f"q_{int(time.time())}"
@@ -140,87 +271,20 @@ async def finalize_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del creation_state[uid]
 
     bme = await context.bot.get_me()
-    share_url = f"https://t.me/share/url?url=https://t.me/{bme.username}?start=quiz_{qid}&text={urllib.parse.quote('Solve this Quiz: ' + db['quizzes'][qid]['title'])}"
+    share_url = f"https://t.me/share/url?url=https://t.me/{bme.username}?start=quiz_{qid}&text={urllib.parse.quote('Solve Quiz: ' + db['quizzes'][qid]['title'])}"
     group_url = f"https://t.me/{bme.username}?startgroup=quiz_{qid}"
     
     kb = [
         [InlineKeyboardButton("🚀 Start Quiz", callback_data=f"startready_{qid}")],
         [InlineKeyboardButton("👥 Add to Group", url=group_url)],
-        [InlineKeyboardButton("↗️ Share with Friends", url=share_url)]
+        [InlineKeyboardButton("↗️ Share Link", url=share_url)]
     ]
     
-    direct_cmd = f"/start_quiz_{qid}"
     await update.message.reply_text(
-        f"🎉 **Quiz Successfully Created & Saved!**\n\n🎲 **Title:** {db['quizzes'][qid]['title']}\n📊 **Total Qs:** {len(db['quizzes'][qid]['questions'])}\n\n👉 Direct Start Command: `{direct_cmd}`\n👉 Start link: `https://t.me/{bme.username}?start=quiz_{qid}`",
+        f"🎉 **Quiz Created!**\n\n🎲 Title: *{db['quizzes'][qid]['title']}* ({len(db['quizzes'][qid]['questions'])} Qs)\n👉 Command: `/start_quiz_{qid}`",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown"
     )
-
-async def process_image_bytes(p_bytes, msg, uid):
-    try:
-        res = ai_model.generate_content([AI_PROMPT, Image.open(io.BytesIO(p_bytes))]).text
-        qs = parse_questions(res)
-        if qs:
-            creation_state[uid]["questions"].extend(qs)
-            await msg.edit_text(f"✅ AI ne is page se **{len(qs)} Questions** banaye!\nTotal Questions: **{len(creation_state[uid]['questions'])}**\n\nAur photo bhejein ya complete karne ke liye `/done` bhejein.")
-        else:
-            await msg.edit_text("⚠️ Image saaf nahi aayi ya questions generate nahi ho sake. Dusri clear photo bhejein.")
-    except Exception:
-        await msg.edit_text("⚠️ OCR Scan error. Kripya saaf photo upload karein.")
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in creation_state or creation_state[uid]["step"] != "QUESTIONS":
-        return
-    msg = await update.message.reply_text("🔍 AI Deep Scan chal raha hai...")
-    f = await (await context.bot.get_file(update.message.photo[-1].file_id)).download_as_bytearray()
-    await process_image_bytes(f, msg, uid)
-
-async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in creation_state or creation_state[uid]["step"] != "QUESTIONS":
-        return
-    doc = update.message.document
-    f = await (await context.bot.get_file(doc.file_id)).download_as_bytearray()
-    if (doc.mime_type and doc.mime_type.startswith("image/")) or doc.file_name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-        msg = await update.message.reply_text("🔍 AI Deep Scanning image file...")
-        await process_image_bytes(f, msg, uid)
-    else:
-        qs = parse_questions(f.decode("utf-8", errors="ignore"))
-        if qs:
-            creation_state[uid]["questions"].extend(qs)
-            await update.message.reply_text(f"📁 **{len(qs)} Qs** add hue! Total: {len(creation_state[uid]['questions'])}\nComplete karne ke liye `/done` bhejein.")
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    text = update.message.text.strip()
-    
-    if text.startswith("/start_quiz_"):
-        qid = text.replace("/start_quiz_", "")
-        await show_quiz_card(update.effective_chat.id, qid, uid, context)
-        return
-
-    if uid not in creation_state:
-        return
-
-    st = creation_state[uid]
-    if st["step"] == "TITLE":
-        st["title"] = text
-        st["step"] = "SUBJECT"
-        await update.message.reply_text(f"✅ Title: *{text}*\nAb **Subject** likhein (e.g. History, GK, Science):", parse_mode="Markdown")
-    elif st["step"] == "SUBJECT":
-        st["subject"] = text
-        st["step"] = "PRICE"
-        kb = [[InlineKeyboardButton("Free (₹0)", callback_data="p_0"), InlineKeyboardButton("₹21", callback_data="p_21")], [InlineKeyboardButton("₹49", callback_data="p_49")]]
-        await update.message.reply_text("💰 Price chunein:", reply_markup=InlineKeyboardMarkup(kb))
-    elif st["step"] == "QUESTIONS":
-        if text.lower() in ["/done", "done"]:
-            await finalize_quiz(update, context)
-            return
-        qs = parse_questions(text)
-        if qs:
-            st["questions"].extend(qs)
-            await update.message.reply_text(f"✅ {len(qs)} Qs add hue! Total: {len(st['questions'])}\nSave karne ke liye `/done` bhejein.")
 
 async def store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.get("quizzes"):
@@ -236,7 +300,7 @@ async def store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb.append([InlineKeyboardButton(f"🎲 {q['title']} ({len(q['questions'])} Qs) - {price_tag}", callback_data=f"view_{qid}")])
     kb.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")])
     
-    text = "📚 **Quiz Store - Apna Quiz Select Karein:**"
+    text = "📚 **Quiz Store:**"
     if update.message:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     elif update.callback_query:
@@ -250,29 +314,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
 
     if d == "menu_main":
-        await q.edit_message_text("👋 **Dulhin Bazar Quiz Bot Menu:**", reply_markup=get_main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text("👋 **Dulhin Bazar Quiz & Study Menu:**", reply_markup=get_main_keyboard(), parse_mode="Markdown")
     elif d == "menu_create":
         creation_state[uid] = {"title": "", "subject": "General", "price": 0, "timer": 15, "questions": [], "step": "TITLE"}
-        await q.edit_message_text("📝 Quiz ka **Title / Naam** likh kar chat mein bhejein:")
+        await q.edit_message_text("📝 Quiz ka **Title / Naam** likh kar bhejein:")
     elif d == "menu_store":
         await store_cmd(update, context)
+    elif d == "menu_pdf_help":
+        await q.edit_message_text("📄 **PDF Notes Generator:**\n\nDirect chat mein topic likhein, jaise:\n• `/pdf Mughal Empire`\n• `/pdf Bharat Ka Samvidhan`\n• `/pdf Indian National Movement`\n• `/pdf Biology Cell Structure`\n\nBot 5-8 second mein PDF send kar dega!")
     elif d == "menu_stop":
         await stop_quiz_cmd(update, context)
     elif d.startswith("p_"):
         creation_state[uid]["price"] = int(d.split("_")[1])
         creation_state[uid]["step"] = "QUESTIONS"
-        await q.edit_message_text("📸 **Ab direct book page ki PHOTO bhejein** (AI saare points extract karega) ya text bhej kar `/done` karein.")
+        await q.edit_message_text("📸 **Ab direct book page ki PHOTO bhejein** (AI saare questions extract karega) ya text bhej kar `/done` karein.")
     elif d.startswith("view_"):
         qid = d.split("_", 1)[1]
         await show_quiz_card(cid, qid, uid, context)
     elif d.startswith("buy_"):
         qz = db["quizzes"].get(d.split("_", 1)[1])
-        await q.edit_message_text(f"💳 **Pay ₹{qz['price']} to UPI:** `{UPI_ID}`\n\nPayment screenshot ke sath Admin ko details bhejein:\n🆔 UID: `{uid}`\n🆔 QID: `{qz['id']}`", parse_mode="Markdown")
+        await q.edit_message_text(f"💳 **Pay ₹{qz['price']} to UPI:** `{UPI_ID}`\n\nPayment details Admin ko bhejein:\n🆔 UID: `{uid}` | QID: `{qz['id']}`", parse_mode="Markdown")
     elif d.startswith("startready_"):
         qid = d.split("_", 1)[1]
         active_sessions[cid] = {"quiz": db["quizzes"][qid], "stats": {}, "map": {}, "run": True}
         
-        # Dramatic Countdown Sequence
         cd_msg = await q.edit_message_text("🔥 **Ready...**", parse_mode="Markdown")
         await asyncio.sleep(1)
         await cd_msg.edit_text("⏳ **3...**", parse_mode="Markdown")
@@ -356,7 +421,7 @@ async def keep_alive():
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("create_quiz", create_quiz_cmd))
+    app.add_handler(CommandHandler("create_quiz", lambda u, c: create_quiz_cmd(u, c)))
     app.add_handler(CommandHandler("done", finalize_quiz))
     app.add_handler(CommandHandler("store", store_cmd))
     app.add_handler(CommandHandler("stop", stop_quiz_cmd))
@@ -381,3 +446,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
