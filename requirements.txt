@@ -1,5 +1,5 @@
-python-telegram-bot>=20.0
-aiohttp
-google-generativeai
-Pillow
-reportlab
+python-telegram-bot==20.7
+aiohttp==3.9.3
+Pillow==10.2.0
+reportlab==4.1.0
+gTTS==2.5.4
