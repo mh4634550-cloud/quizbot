@@ -42,7 +42,155 @@ db = load_data()
 creation_state = {}
 active_sessions = {}
 search_state = {}
+shuffle_state = {}  # New: Track shuffle mode per user
 
+# ============= NEW: SEARCH BAR HANDLER =============
+async def search_bar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle search queries from the search bar"""
+    uid = update.effective_user.id
+    query = update.message.text.strip()
+    
+    if query.startswith('/'):
+        return
+    
+    # Search in quizzes
+    results = []
+    for qid, qz in db.get("quizzes", {}).items():
+        if query.lower() in qz.get("title", "").lower() or query.lower() in qz.get("subject", "").lower():
+            results.append((qid, qz))
+        else:
+            # Search in questions
+            for q in qz.get("questions", []):
+                if query.lower() in q.get("question", "").lower():
+                    results.append((qid, qz))
+                    break
+    
+    if results:
+        keyboard = []
+        for qid, qz in results[:10]:  # Max 10 results
+            price_tag = "FREE" if qz["price"] == 0 else f"₹{qz['price']}"
+            keyboard.append([InlineKeyboardButton(
+                f"🎲 {qz['title']} ({len(qz['questions'])} Qs) - {price_tag}", 
+                callback_data=f"view_{qid}"
+            )])
+        keyboard.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")])
+        
+        await update.message.reply_text(
+            f"🔍 *Search Results for:* `{query}`\nFound {len(results)} quiz(es)",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    else:
+        # If no quiz found, try AI search
+        await execute_search(query, update, context)
+
+# ============= NEW: SHUFFLE TOGGLE =============
+async def toggle_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle shuffle mode ON/OFF"""
+    uid = update.effective_user.id
+    current = shuffle_state.get(uid, False)
+    shuffle_state[uid] = not current
+    status = "✅ ON" if shuffle_state[uid] else "❌ OFF"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Toggle Shuffle", callback_data="toggle_shuffle")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")]
+    ]
+    
+    msg = f"🔀 *Shuffle Mode:* {status}\n\n"
+    msg += "When ON, questions will be randomized during quiz.\n"
+    msg += "When OFF, questions appear in original order."
+    
+    if update.message:
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+# ============= ENHANCED MAIN KEYBOARD =============
+def get_main_keyboard():
+    """Main menu with all options in single rows (no 3-row restriction)"""
+    return InlineKeyboardMarkup([
+        # All options displayed directly, no 3-row limit
+        [InlineKeyboardButton("📸 Photo → Objective Quiz", callback_data="menu_photo")],
+        [InlineKeyboardButton("➕ Create Custom Quiz", callback_data="menu_create")],
+        [InlineKeyboardButton("🔍 Search / Current Affairs", callback_data="menu_search")],
+        [InlineKeyboardButton("📘 Static GK", callback_data="topic_static_gk"), 
+         InlineKeyboardButton("📰 Current Affairs", callback_data="topic_current_affairs")],
+        [InlineKeyboardButton("📚 NCERT Class 6–12 Quiz", callback_data="menu_ncert")],
+        [InlineKeyboardButton("📚 Lucent / Saar Sangrah Scan", callback_data="menu_bookscan")],
+        [InlineKeyboardButton("🛒 Quiz Store", callback_data="menu_store")],
+        [InlineKeyboardButton("🔀 Shuffle Mode", callback_data="toggle_shuffle")],  # New
+        [InlineKeyboardButton("🛑 Stop Running Quiz", callback_data="menu_stop")]
+    ])
+
+# ============= ENHANCED IMAGE SCAN =============
+async def enhanced_image_scan(image_bytes, msg, uid):
+    """Enhanced image scanning with better OCR and MCQ generation"""
+    try:
+        if uid not in creation_state:
+            raise Exception("Pehle Photo → Quiz ya NCERT mode select karein")
+        
+        # Better image preprocessing
+        pil_img = Image.open(io.BytesIO(bytes(image_bytes))).convert("RGB")
+        w, h = pil_img.size
+        max_side = max(w, h)
+        
+        # Upscale small images
+        if max_side < 1800:
+            scale = min(2.5, 2200 / max_side)
+            pil_img = pil_img.resize((int(w*scale), int(h*scale)), Image.Resampling.LANCZOS)
+        
+        # Enhanced preprocessing
+        pil_img = ImageOps.autocontrast(pil_img, cutoff=2)
+        pil_img = pil_img.filter(ImageFilter.SHARPEN)
+        pil_img = pil_img.filter(ImageFilter.DETAIL)
+        pil_img.thumbnail((3500, 3500), Image.Resampling.LANCZOS)
+        
+        img_byte_arr = io.BytesIO()
+        pil_img.save(img_byte_arr, format="JPEG", quality=95, optimize=True)
+        raw_bytes = img_byte_arr.getvalue()
+
+        # Two-pass approach for better accuracy
+        ocr_prompt = """Read this page exactly. Transcribe all readable educational text, headings, bullets, tables, labels and captions. 
+        Preserve Hindi Devanagari, names, numbers, dates and scientific terms. 
+        Do not invent or summarize. Output only the transcription."""
+        
+        source_text = await generate_ai_text(ocr_prompt, image_bytes=raw_bytes)
+        if not source_text or len(source_text.strip()) < 30:
+            raise Exception("Page ka text detect nahi hua. Clear, straight, high-resolution photo bhejein.")
+
+        quiz_prompt = AI_TEXT_TO_QUIZ_PROMPT + "\n\n" + source_text[:18000]
+        result = await generate_ai_text(quiz_prompt)
+        qs = parse_questions(result)
+        
+        if not qs:
+            # Retry with vision prompt
+            result = await generate_ai_text(AI_OCR_PROMPT, image_bytes=raw_bytes)
+            qs = parse_questions(result)
+        
+        if qs:
+            creation_state[uid]["questions"].extend(qs)
+            await msg.edit_text(
+                f"✅ *Photo scan successful!* 📸\n"
+                f"📝 {len(qs)} MCQs banaye.\n"
+                f"📊 Total Questions: {len(creation_state[uid]['questions'])}\n\n"
+                f"📸 Aur photos bhejo ya `/done` se save karo.",
+                parse_mode="Markdown"
+            )
+        else:
+            await msg.edit_text(
+                "⚠️ *Text read hua, lekin MCQ format nahi bana.*\n\n"
+                "💡 Tips:\n"
+                "• Clear, straight photo bhejein\n"
+                "• Bright lighting use karein\n"
+                "• Text focus me ho\n"
+                "• Page full visible ho",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        await msg.edit_text(f"⚠️ *Scan error:* {str(e)[:350]}", parse_mode="Markdown")
+
+# ============= AI FUNCTIONS =============
 AI_OCR_PROMPT = """You are an expert OCR + exam question generator.
 Read the ENTIRE uploaded page carefully. This can be NCERT, Science, Social Science, History, Geography, Civics, Biology, Chemistry, Physics, Maths, GK, or any study material.
 
@@ -84,7 +232,6 @@ Answer: A
 
 SOURCE TEXT:
 """
-
 
 async def generate_ai_text(prompt, image_bytes=None, use_web=False):
     """Generate AI text. Groq is primary; Gemini can be used independently as fallback."""
@@ -155,6 +302,7 @@ async def generate_ai_text(prompt, image_bytes=None, use_web=False):
             errors.append(str(e))
     raise Exception("AI failed: " + " | ".join(errors)[:700])
 
+# ============= HELPER FUNCTIONS =============
 def create_welcome_audio():
     buf = io.BytesIO()
     speech_text = "Hii! My name is Maruf. Kaise ho aap log? Aap logon ka swagat hai mere bot mein. Welcome to my quiz bot!"
@@ -237,18 +385,7 @@ def generate_pdf_buffer(title, content_text):
     out.seek(0)
     return out
 
-def get_main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📸 Photo → Objective Quiz", callback_data="menu_photo")],
-        [InlineKeyboardButton("➕ Create Custom Quiz", callback_data="menu_create")],
-        [InlineKeyboardButton("🔍 Search / Current Affairs", callback_data="menu_search")],
-        [InlineKeyboardButton("📘 Static GK", callback_data="topic_static_gk"), InlineKeyboardButton("📰 Current Affairs", callback_data="topic_current_affairs")],
-        [InlineKeyboardButton("📚 NCERT Class 6–12 Quiz", callback_data="menu_ncert")],
-        [InlineKeyboardButton("📚 Lucent / Saar Sangrah Scan", callback_data="menu_bookscan")],
-        [InlineKeyboardButton("🛒 Quiz Store", callback_data="menu_store")],
-        [InlineKeyboardButton("🛑 Stop Running Quiz", callback_data="menu_stop")]
-    ])
-
+# ============= COMMAND HANDLERS =============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if context.args:
@@ -260,11 +397,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         voice_fp = await asyncio.to_thread(create_welcome_audio)
-        await context.bot.send_voice(chat_id=chat_id, voice=voice_fp, caption="🤖 *Maruf Hussain - Quiz Assistant*")
+        await context.bot.send_voice(chat_id=chat_id, voice=voice_fp, caption="🤖 *Maruf Hussain - Quiz Assistant*", parse_mode="Markdown")
     except Exception:
         pass
 
-    text = "👋 **Welcome to Dulhin Bazar Study & Quiz Bot**\n\n📄 **Topic Notes/PDF:** kisi bhi subject ya topic ka naam bhejein.\n📸 **Photo to Quiz:** direct clear photo bhej sakte hain.\n🔍 **Search/Current Affairs:** button ya `/search <question>` use karein.\n📚 **Lucent/Saar Sangrah:** apne pages scan karke objective MCQs bana sakte hain."
+    text = """👋 **Welcome to Dulhin Bazar Study & Quiz Bot**
+
+📄 **Topic Notes/PDF:** kisi bhi subject ya topic ka naam bhejein.
+📸 **Photo to Quiz:** direct clear photo bhej sakte hain.
+🔍 **Search/Current Affairs:** button ya `/search <question>` use karein.
+📚 **Lucent/Saar Sangrah:** apne pages scan karke objective MCQs bana sakte hain.
+🔀 **Shuffle Mode:** questions ko randomize kar sakte hain."""
+    
     if update.message:
         await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
     elif update.callback_query:
@@ -333,7 +477,7 @@ Include:
 1. Core Concepts & Chronology / Key Facts
 2. Important Exam Points (Bullet format)
 3. 10 Most Expected Multiple Choice Questions with Answers at the end.
-Language: पूरी तरह हिंदी (Devanagari) में लिखो। Roman Hindi/Hinglish बिल्कुल मत लिखो। केवल जरूरी English technical terms, abbreviations और exam terms को English में रख सकते हो."""
+Language: पूरी तरह हिंदी (Devanagari) में लिखो। Roman Hindi/Hinglish बिल्कुल मत लिखो। केवल जरूरी English technical terms, abbreviations और exam terms को English में रख सकते हो।"""
 
     try:
         raw_text = await generate_ai_text(prompt)
@@ -397,48 +541,12 @@ async def finalize_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def process_image_bytes(p_bytes, msg, uid):
-    try:
-        if uid not in creation_state:
-            raise Exception("Pehle Photo → Quiz ya NCERT mode select karein")
-        pil_img = Image.open(io.BytesIO(bytes(p_bytes))).convert("RGB")
-        # OCR-friendly preprocessing: upscale small pages, contrast and light sharpening.
-        w, h = pil_img.size
-        max_side = max(w, h)
-        if max_side < 1800:
-            scale = min(2.0, 2200 / max_side)
-            pil_img = pil_img.resize((int(w*scale), int(h*scale)), Image.Resampling.LANCZOS)
-        pil_img = ImageOps.autocontrast(pil_img)
-        pil_img = pil_img.filter(ImageFilter.SHARPEN)
-        pil_img.thumbnail((3000, 3000), Image.Resampling.LANCZOS)
-        img_byte_arr = io.BytesIO()
-        pil_img.save(img_byte_arr, format="JPEG", quality=95, optimize=True)
-        raw_bytes = img_byte_arr.getvalue()
-
-        # Two-pass approach: image -> exact visible text -> MCQs. This is much more reliable than asking OCR + MCQ in one pass.
-        ocr_prompt = """Read this page exactly. Transcribe all readable educational text, headings, bullets, tables, labels and captions. Preserve Hindi Devanagari, names, numbers, dates and scientific terms. Do not invent or summarize. Output only the transcription."""
-        source_text = await generate_ai_text(ocr_prompt, image_bytes=raw_bytes)
-        if not source_text or len(source_text.strip()) < 30:
-            raise Exception("Page ka text detect nahi hua. Clear, straight, high-resolution photo bhejein.")
-
-        quiz_prompt = AI_TEXT_TO_QUIZ_PROMPT + "\n\n" + source_text[:18000]
-        result = await generate_ai_text(quiz_prompt)
-        qs = parse_questions(result)
-        if not qs:
-            # Retry once with the original vision prompt if parsing failed.
-            result = await generate_ai_text(AI_OCR_PROMPT, image_bytes=raw_bytes)
-            qs = parse_questions(result)
-        if qs:
-            creation_state[uid]["questions"].extend(qs)
-            await msg.edit_text(f"✅ Photo scan successful! {len(qs)} MCQs banaye.\nTotal Questions: {len(creation_state[uid]['questions'])}\n\nAur photos/text bhejo ya /done se save karo.")
-        else:
-            await msg.edit_text("⚠️ Text read hua, lekin MCQ format nahi bana. Photo ko seedha, bright aur high-resolution rakho; phir dobara bhejo.")
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Scan error: {str(e)[:350]}")
+    """Process image bytes for OCR - uses enhanced scanning"""
+    await enhanced_image_scan(p_bytes, msg, uid)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
-    # Direct photo -> quiz mode. User ko create flow start karna zaroori nahi.
     if uid not in creation_state:
         creation_state[uid] = {
             "title": "Photo Scan Quiz",
@@ -481,9 +589,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_quiz_card(update.effective_chat.id, qid, uid, context)
         return
 
+    # NEW: Check if this is a search query
     if search_state.get(uid):
         del search_state[uid]
-        await execute_search(text, update, context)
+        await search_bar_handler(update, context)
         return
 
     if uid not in creation_state:
@@ -501,7 +610,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             st["source_text"] = (st.get("source_text", "") + "\n" + text).strip()
             source = st["source_text"]
-            # Generate in bounded chunks to avoid oversized API requests.
             await make_quiz_from_source_text(uid, source[-24000:], status, st.get("subject", "NCERT Chapter"))
             st["source_text"] = ""
         except Exception as e:
@@ -532,7 +640,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await status.edit_text(f"⚠️ NCERT Quiz Error: {str(e)[:250]}")
 
-
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     creation_state.pop(uid, None)
@@ -549,272 +656,4 @@ async def store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     kb = []
     for qid, q in db["quizzes"].items():
-        price_tag = "FREE" if q["price"] == 0 else f"₹{q['price']}"
-        kb.append([InlineKeyboardButton(f"🎲 {q['title']} ({len(q['questions'])} Qs) - {price_tag}", callback_data=f"view_{qid}")])
-    kb.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")])
-    
-    text = "📚 **Quiz Store:**"
-    if update.message:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-
-
-async def send_topic_notes(topic_name, target_message, context: ContextTypes.DEFAULT_TYPE, use_web=False):
-    status = await target_message.reply_text(f"🤖 {topic_name} ke exam notes bana raha hoon...")
-    prompt = f"""You are an exam-preparation assistant for Indian competitive exams.
-Topic: {topic_name}
-Give high-yield notes in Roman Hindi + simple English.
-Include: key facts, dates if relevant, one-line revision points, and 10 objective MCQs with answers.
-If this is current affairs, use only fresh verifiable information and mention exact dates.
-Do not claim that this is verbatim content from any copyrighted commercial book."""
-    try:
-        text = await generate_ai_text(prompt, use_web=use_web)
-        # Telegram message limit handling
-        if len(text) <= 3900:
-            await status.edit_text(text)
-        else:
-            await status.edit_text(text[:3900])
-            for i in range(3900, len(text), 3900):
-                await target_message.reply_text(text[i:i+3900])
-    except Exception as e:
-        await status.edit_text(f"⚠️ AI Error: {str(e)[:250]}")
-
-async def show_ncert_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("🎓 Class 6", callback_data="ncert_class_6"), InlineKeyboardButton("🎓 Class 7", callback_data="ncert_class_7")],
-        [InlineKeyboardButton("🎓 Class 8", callback_data="ncert_class_8"), InlineKeyboardButton("🎓 Class 9", callback_data="ncert_class_9")],
-        [InlineKeyboardButton("🎓 Class 10", callback_data="ncert_class_10"), InlineKeyboardButton("🎓 Class 11", callback_data="ncert_class_11")],
-        [InlineKeyboardButton("🎓 Class 12", callback_data="ncert_class_12")],
-        [InlineKeyboardButton("📸 Scan Chapter Page", callback_data="menu_photo")],
-        [InlineKeyboardButton("📝 Send Chapter Text", callback_data="ncert_text")],
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")]
-    ]
-    target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text(
-        "📚 NCERT Class 6–12 Quiz\n\nClass choose karo. Uske baad chapter ka text ya pages bhejo; bot source ke basis par objective MCQs banayega.",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def ncert_text_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    creation_state[uid] = {
-        "title": "NCERT Chapter Quiz", "subject": "NCERT", "price": 0,
-        "timer": 15, "questions": [], "step": "NCERT_TEXT", "source_text": ""
-    }
-    target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text(
-        "📝 NCERT chapter ka text paste karo. Main isi text se Hindi objective MCQs banaunga.\n\n"
-        "Bada chapter ho to parts mein bhejo; end mein /done bhejo."
-    )
-
-async def make_quiz_from_source_text(uid, text, msg, subject="NCERT Chapter"):
-    prompt = AI_TEXT_TO_QUIZ_PROMPT + "\n\n" + text[:24000]
-    result = await generate_ai_text(prompt)
-    qs = parse_questions(result)
-    if not qs:
-        raise Exception("AI ne valid MCQ format return nahi kiya")
-    creation_state[uid]["questions"].extend(qs)
-    await msg.edit_text(
-        f"✅ {len(qs)} MCQs ban gaye. Total: {len(creation_state[uid]['questions'])}\n"
-        "Aur chapter text/page bhej sakte ho. Save/start ke liye /done bhejo."
-    )
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    d = q.data
-    uid = update.effective_user.id
-    cid = update.effective_chat.id
-
-    if d == "menu_main":
-        await q.edit_message_text("👋 **Dulhin Bazar Quiz & Study Menu:**", reply_markup=get_main_keyboard(), parse_mode="Markdown")
-    elif d == "menu_photo":
-        creation_state[uid] = {"title": "Photo Scan Quiz", "subject": "Scanned Notes", "price": 0, "timer": 15, "questions": [], "step": "QUESTIONS", "auto_photo": True}
-        await q.edit_message_text("📸 Ab book/notes ka clear PHOTO bhejo. Main usse objective MCQs bana dunga. Multiple photos bhej sakte ho; end me /done bhejo.")
-    elif d == "menu_ncert":
-        await show_ncert_menu(update, context)
-    elif d.startswith("ncert_class_"):
-        cls = d.rsplit("_", 1)[1]
-        creation_state[uid] = {"title": f"NCERT Class {cls} Chapter Quiz", "subject": f"NCERT Class {cls}", "price": 0, "timer": 15, "questions": [], "step": "NCERT_TEXT", "source_text": "", "auto_photo": True}
-        await q.edit_message_text(f"🎓 NCERT Class {cls} selected.\n\n📸 Chapter page ki clear photo bhejo, ya text paste karo. Main usi source se objective MCQs banaunga. End me /done.")
-    elif d == "ncert_text":
-        await ncert_text_start(update, context)
-    elif d == "menu_bookscan":
-        creation_state[uid] = {"title": "Book Scan Quiz", "subject": "Book Scan", "price": 0, "timer": 15, "questions": [], "step": "QUESTIONS", "auto_photo": True}
-        await q.edit_message_text("📚 Lucent 2026, Saar Sangrah ya kisi bhi apni book/notes ke pages ka PHOTO bhejo. Main sirf tumhare bheje hue pages ko scan karke MCQs banaunga. End me /done bhejo.")
-    elif d == "topic_static_gk":
-        await q.edit_message_text("📘 Static GK generate ho raha hai...")
-        await send_topic_notes("Static GK for SSC/Railway/Police exams", q.message, context, use_web=False)
-    elif d == "topic_current_affairs":
-        await q.edit_message_text("📰 Latest Current Affairs web se verify ho raha hai...")
-        await send_topic_notes("Latest India and World Current Affairs", q.message, context, use_web=True)
-    elif d == "menu_search":
-        search_state[uid] = True
-        await q.edit_message_text("🔍 **Question Doubt / Fact-Check:**\n\nAb apna question/doubt next message me paste karein. Current affairs ho to AI web se latest info check karega.", parse_mode="Markdown")
-    elif d == "menu_create":
-        creation_state[uid] = {"title": "", "subject": "General", "price": 0, "timer": 15, "questions": [], "step": "TITLE"}
-        await q.edit_message_text("📝 Quiz ka **Title / Naam** likh kar bhejein:")
-    elif d == "menu_store":
-        await store_cmd(update, context)
-    elif d == "menu_stop":
-        await stop_quiz_cmd(update, context)
-    elif d.startswith("p_"):
-        creation_state[uid]["price"] = int(d.split("_")[1])
-        creation_state[uid]["step"] = "QUESTIONS"
-        await q.edit_message_text("📸 **Ab direct book page ki PHOTO bhejein** (AI questions extract karega) ya text bhej kar `/done` karein.")
-    elif d.startswith("view_"):
-        qid = d.split("_", 1)[1]
-        await show_quiz_card(cid, qid, uid, context)
-    elif d.startswith("buy_"):
-        qz = db["quizzes"].get(d.split("_", 1)[1])
-        await q.edit_message_text(f"💳 **Pay ₹{qz['price']} to UPI:** `{UPI_ID}`\n\nPayment details Admin ko bhejein:\n🆔 UID: `{uid}` | QID: `{qz['id']}`", parse_mode="Markdown")
-    elif d.startswith("startready_"):
-        qid = d[len("startready_"):]
-        if qid not in db.get("quizzes", {}):
-            await q.edit_message_text("⚠️ Quiz nahi mila.")
-            return
-        # Shuffle is always ON; no ON/OFF option is shown to the user.
-        active_sessions[cid] = {"quiz": db["quizzes"][qid], "stats": {}, "map": {}, "run": True, "shuffle": True}
-        
-        cd_msg = await q.edit_message_text("🔥 **Ready...**", parse_mode="Markdown")
-        await asyncio.sleep(1)
-        await cd_msg.edit_text("⏳ **3...**", parse_mode="Markdown")
-        await asyncio.sleep(1)
-        await cd_msg.edit_text("⏳ **2...**", parse_mode="Markdown")
-        await asyncio.sleep(1)
-        await cd_msg.edit_text("⏳ **1...**", parse_mode="Markdown")
-        await asyncio.sleep(1)
-        await cd_msg.edit_text("🚀 **Set... GO!**", parse_mode="Markdown")
-        await asyncio.sleep(0.5)
-        
-        asyncio.create_task(run_quiz(cid, context))
-
-async def run_quiz(chat_id, context: ContextTypes.DEFAULT_TYPE):
-    s = active_sessions.get(chat_id)
-    if not s:
-        return
-    questions = list(s["quiz"]["questions"])
-    if s.get("shuffle"):
-        random.shuffle(questions)
-
-    for idx, qd in enumerate(questions):
-        if not s.get("run"):
-            break
-        try:
-            m = await context.bot.send_poll(
-                chat_id=chat_id,
-                question=f"Q{idx+1}. {qd['question']}",
-                options=qd["options"],
-                type=Poll.QUIZ,
-                correct_option_id=qd["correct_id"],
-                open_period=s["quiz"]["timer"],
-                is_anonymous=False
-            )
-            s["map"][m.poll.id] = qd["correct_id"]
-        except Exception:
-            continue
-        for _ in range(s["quiz"]["timer"] + 2):
-            if not s.get("run"):
-                break
-            await asyncio.sleep(1)
-            
-    if s.get("run"):
-        sorted_users = sorted(s["stats"].values(), key=lambda x: x["c"], reverse=True)
-        res = f"🏁 '*{s['quiz']['title']}*' Finished!\n\n🏆 **Leaderboard:**\n"
-        for r, u in enumerate(sorted_users, 1):
-            res += f"{r}. 👤 *{u['n']}*: ✅ {u['c']} | ❌ {u['w']}\n"
-            
-        await context.bot.send_message(chat_id, res if s["stats"] else "🏁 Quiz Finished!", parse_mode="Markdown")
-        
-        if sorted_users:
-            winner = sorted_users[0]
-            try:
-                winner_voice = await asyncio.to_thread(create_winner_audio, winner['n'])
-                await context.bot.send_voice(
-                    chat_id=chat_id, 
-                    voice=winner_voice, 
-                    caption=f"🎉 *Winner Voice Note: Congratulations {winner['n']}!*"
-                )
-            except Exception:
-                pass
-                
-        if chat_id in active_sessions:
-            del active_sessions[chat_id]
-
-async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ans = update.poll_answer
-    for s in active_sessions.values():
-        if ans.poll_id in s["map"]:
-            u = s["stats"].setdefault(ans.user.id, {"n": ans.user.first_name, "c": 0, "w": 0})
-            if ans.option_ids and ans.option_ids[0] == s["map"][ans.poll_id]:
-                u["c"] += 1
-            else:
-                u["w"] += 1
-
-async def stop_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    if cid in active_sessions:
-        active_sessions[cid]["run"] = False
-        msg = "🛑 Quiz stopped successfully."
-    else:
-        msg = "⚠️ Koi active quiz nahi chal raha hai."
-        
-    if update.message:
-        await update.message.reply_text(msg)
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(msg)
-
-async def handle_http(request):
-    return web.Response(text="Bot Online 24/7!")
-
-async def keep_alive():
-    await asyncio.sleep(30)
-    while True:
-        try:
-            urllib.request.urlopen("https://quizbot-1vsr.onrender.com", timeout=10)
-        except Exception:
-            pass
-        await asyncio.sleep(300)
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print("Telegram error:", repr(context.error))
-    try:
-        if isinstance(update, Update) and update.effective_chat:
-            await context.bot.send_message(update.effective_chat.id, f"⚠️ Internal error: {type(context.error).__name__}. Render logs check karein.")
-    except Exception:
-        pass
-
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("search", search_command))
-    app.add_handler(CommandHandler("ncert", show_ncert_menu))
-    app.add_handler(CommandHandler("create_quiz", create_quiz_cmd))
-    app.add_handler(CommandHandler("done", finalize_quiz))
-    app.add_handler(CommandHandler("store", store_cmd))
-    app.add_handler(CommandHandler("stop", stop_quiz_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(PollAnswerHandler(handle_answer))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_error_handler(error_handler)
-
-    server = web.Application()
-    server.router.add_get("/", handle_http)
-    runner = web.AppRunner(server)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080))).start()
-    asyncio.create_task(keep_alive())
-    print("Bot Live...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    while True:
-        await asyncio.sleep(3600)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        price_tag = "FREE" if q
