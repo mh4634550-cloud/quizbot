@@ -1,22 +1,22 @@
 import os, asyncio, io, re, json, random, time, urllib.request, urllib.parse, base64
 from aiohttp import web, ClientSession
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, PollAnswerHandler, ContextTypes, filters
 from gtts import gTTS
 
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-from reportlab.lib import colors
+try:
+    from fpdf import FPDF
+except ImportError:
+    FPDF = None
 
 TOKEN = os.environ.get("BOT_TOKEN")
 UPI_ID = os.environ.get("UPI_ID", "marufhussain318-2@oksbi")
 
-API_KEY = (
-    os.environ.get("GroqCloud") 
-    or os.environ.get("GEMINI_KEY") 
-    or os.environ.get("GROQ_API_KEY")
-)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("GroqCloud")
+GEMINI_KEY = os.environ.get("GEMINI_KEY")
+API_KEY = GROQ_API_KEY or GEMINI_KEY
+
 DATA_FILE = "quiz_db.json"
 
 if not TOKEN or not API_KEY:
@@ -43,98 +43,117 @@ creation_state = {}
 active_sessions = {}
 search_state = {}
 
-AI_OCR_PROMPT = """Read this book page very carefully. Extract EVERY single historical fact, date, king name, event, battle, book, reform, and list item.
-Convert all information into Multiple Choice Questions (MCQs) in Hindi/Hinglish.
+AI_OCR_PROMPT = """You are an expert OCR + exam question generator.
+Read the ENTIRE uploaded page carefully. This can be NCERT, Science, Social Science, History, Geography, Civics, Biology, Chemistry, Physics, Maths, GK, or any study material.
 
-Strict Format for each question:
-Q1. Question text here?
-A) Option 1
-B) Option 2
-C) Option 3
-D) Option 4
-Answer: Correct Option Letter (A/B/C/D)
+Rules:
+- Read all visible printed text, headings, bullets, tables, labels, captions and important diagram text.
+- Do NOT invent facts that are not present on the page.
+- Preserve names, numbers, dates, scientific terms and spellings as accurately as possible.
+- Generate 8-15 objective MCQs from the information actually visible on this page. If the page has less information, generate fewer questions rather than inventing.
+- Use Hindi in Devanagari script. English technical/scientific terms may remain in English when appropriate. Do NOT use Roman Hindi/Hinglish.
+- Every question must have exactly 4 options and one correct answer.
 
-Leave a blank line between each question. Output ONLY questions and answers."""
+Strict format:
+Q1. प्रश्न?
+A) विकल्प 1
+B) विकल्प 2
+C) विकल्प 3
+D) विकल्प 4
+Answer: A
+
+Output ONLY MCQs. No introduction, no explanation."""
+
+AI_TEXT_TO_QUIZ_PROMPT = """You are an expert Indian exam question generator.
+Create objective MCQs ONLY from the source text below. The source may be NCERT Class 6-12 Hindi-medium Science, Social Science, History, Geography, Political Science, Economics, Biology, Chemistry, Physics, or another study chapter.
+
+Rules:
+- Do not add facts that are not supported by the source text.
+- Use Hindi Devanagari script. Do NOT write Roman Hindi/Hinglish.
+- Create 10-20 high-quality MCQs depending on source length.
+- Exactly 4 options per question.
+- Exactly one correct answer.
+
+Strict format:
+Q1. प्रश्न?
+A) विकल्प 1
+B) विकल्प 2
+C) विकल्प 3
+D) विकल्प 4
+Answer: A
+
+SOURCE TEXT:
+"""
+
 
 async def generate_ai_text(prompt, image_bytes=None, use_web=False):
-    """Generate text with Groq or Gemini.
+    """Generate AI text. Groq is primary; Gemini can be used independently as fallback."""
+    timeout = 120
 
-    - Groq text/current-affairs: current supported models.
-    - Groq image OCR: qwen/qwen3.6-27b (multimodal).
-    - Gemini fallback: gemini-2.5-flash (stable multimodal).
-    """
-    timeout = 90
-
-    if API_KEY.startswith("gsk_"):
+    async def groq_call():
+        if not GROQ_API_KEY:
+            raise Exception("GROQ_API_KEY not configured")
         url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-        }
-
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         if image_bytes:
             b64_img = base64.b64encode(image_bytes).decode("utf-8")
             payload = {
                 "model": "qwen/qwen3.6-27b",
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
-                    ],
-                }],
-                "temperature": 0.2,
-                "max_completion_tokens": 5000,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                ]}],
+                "temperature": 0.1, "max_completion_tokens": 5000
             }
         else:
             payload = {
-                "model": "groq/compound" if use_web else "openai/gpt-oss-120b",
+                "model": "groq/compound-mini" if use_web else "openai/gpt-oss-120b",
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
+                "temperature": 0.2, "max_completion_tokens": 4000
             }
-
-        client_timeout = __import__("aiohttp").ClientTimeout(total=timeout)
-        async with ClientSession(timeout=client_timeout) as session:
+            if use_web:
+                payload["search_settings"] = {"country": "IN"}
+        timeout_obj = __import__("aiohttp").ClientTimeout(total=timeout)
+        async with ClientSession(timeout=timeout_obj) as session:
             async with session.post(url, json=payload, headers=headers) as resp:
                 raw = await resp.text()
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    data = {"raw": raw}
+                try: data = json.loads(raw)
+                except Exception: data = {"raw": raw}
                 if resp.status != 200:
-                    raise Exception(f"Groq HTTP {resp.status}: {str(data)[:300]}")
-                try:
-                    return data["choices"][0]["message"]["content"]
-                except Exception:
-                    raise Exception(f"Groq response format error: {str(data)[:300]}")
+                    raise Exception(f"Groq HTTP {resp.status}: {str(data)[:400]}")
+                return data["choices"][0]["message"]["content"]
 
-    # Gemini API key fallback
-    model = "gemini-2.5-flash"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={API_KEY}"
-    parts = []
-    if image_bytes:
-        b64_data = base64.b64encode(image_bytes).decode("utf-8")
-        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64_data}})
-    parts.append({"text": prompt})
-
-    client_timeout = __import__("aiohttp").ClientTimeout(total=timeout)
-    async with ClientSession(timeout=client_timeout) as session:
-        async with session.post(
-            url,
-            json={"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.2}},
-            headers={"Content-Type": "application/json"},
-        ) as resp:
-            raw = await resp.text()
-            try:
-                data = json.loads(raw)
-            except Exception:
-                data = {"raw": raw}
-            if resp.status != 200:
-                raise Exception(f"Gemini HTTP {resp.status}: {str(data)[:300]}")
-            try:
+    async def gemini_call():
+        if not GEMINI_KEY:
+            raise Exception("GEMINI_KEY not configured")
+        model = "gemini-2.5-flash"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        parts = []
+        if image_bytes:
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode("utf-8")}})
+        parts.append({"text": prompt})
+        timeout_obj = __import__("aiohttp").ClientTimeout(total=timeout)
+        async with ClientSession(timeout=timeout_obj) as session:
+            async with session.post(url, json={"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.1}}, headers={"Content-Type": "application/json"}) as resp:
+                raw = await resp.text()
+                try: data = json.loads(raw)
+                except Exception: data = {"raw": raw}
+                if resp.status != 200:
+                    raise Exception(f"Gemini HTTP {resp.status}: {str(data)[:400]}")
                 return data["candidates"][0]["content"]["parts"][0]["text"]
-            except Exception:
-                raise Exception(f"Gemini response format error: {str(data)[:300]}")
+
+    errors = []
+    if GROQ_API_KEY:
+        try:
+            return await groq_call()
+        except Exception as e:
+            errors.append(str(e))
+    if GEMINI_KEY:
+        try:
+            return await gemini_call()
+        except Exception as e:
+            errors.append(str(e))
+    raise Exception("AI failed: " + " | ".join(errors)[:700])
 
 def create_welcome_audio():
     buf = io.BytesIO()
@@ -176,38 +195,47 @@ def parse_questions(text):
             out.append({"question": q_txt[:280], "options": opts[:4], "correct_id": min(c_idx, len(opts) - 1)})
     return out
 
-def generate_pdf_buffer(title, content_text):
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=letter)
-    width, height = letter
-    
-    def draw_header():
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(40, height - 40, f"Dulhin Bazar Notes: {title[:40]}")
-        c.setStrokeColor(colors.HexColor("#0088cc"))
-        c.setLineWidth(1.5)
-        c.line(40, height - 45, width - 40, height - 45)
-        c.setFont("Helvetica", 9)
+def _ensure_hindi_fonts():
+    if FPDF is None:
+        raise RuntimeError("fpdf2 install nahi hai. requirements.txt me fpdf2 add karein.")
+    font_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+    os.makedirs(font_dir, exist_ok=True)
+    files = {
+        "regular": ("NotoSansDevanagari-Regular.ttf", "https://raw.githubusercontent.com/googlefonts/noto-fonts/main/hinted/ttf/NotoSansDevanagari/NotoSansDevanagari-Regular.ttf"),
+        "bold": ("NotoSansDevanagari-Bold.ttf", "https://raw.githubusercontent.com/googlefonts/noto-fonts/main/hinted/ttf/NotoSansDevanagari/NotoSansDevanagari-Bold.ttf"),
+    }
+    paths = {}
+    for key, (name, url) in files.items():
+        path = os.path.join(font_dir, name)
+        if not os.path.exists(path) or os.path.getsize(path) < 10000:
+            urllib.request.urlretrieve(url, path)
+        paths[key] = path
+    return paths["regular"], paths["bold"]
 
-    draw_header()
-    y = height - 65
-    clean_text = content_text.replace("**", "").replace("##", "").replace("*", "-")
-    clean_text = clean_text.encode('ascii', errors='ignore').decode('ascii')
-    lines = clean_text.split("\n")
-    
-    for line in lines:
-        wrapped_chunks = [line[i:i+85] for i in range(0, len(line), 85)] if line else [""]
-        for chunk in wrapped_chunks:
-            if y < 55:
-                c.showPage()
-                draw_header()
-                y = height - 65
-            c.drawString(40, y, chunk)
-            y -= 14
-            
-    c.save()
-    buf.seek(0)
-    return buf
+def generate_pdf_buffer(title, content_text):
+    regular, bold = _ensure_hindi_fonts()
+    pdf = FPDF(format="A4")
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.add_page()
+    pdf.add_font("NotoDeva", "", regular)
+    pdf.add_font("NotoDeva", "B", bold)
+    pdf.set_text_shaping(True, script="deva", language="hin", direction="ltr")
+    pdf.set_font("NotoDeva", "B", 16)
+    pdf.multi_cell(0, 10, f"Dulhin Bazar Study Notes: {title}")
+    pdf.ln(2)
+    pdf.set_font("NotoDeva", "", 11)
+    clean = content_text.replace("**", "").replace("###", "").replace("##", "")
+    for line in clean.splitlines():
+        line = line.strip()
+        if not line:
+            pdf.ln(3)
+            continue
+        pdf.multi_cell(0, 7, line)
+    out = io.BytesIO()
+    data = pdf.output(dest="S")
+    out.write(bytes(data))
+    out.seek(0)
+    return out
 
 def get_main_keyboard():
     return InlineKeyboardMarkup([
@@ -215,6 +243,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("➕ Create Custom Quiz", callback_data="menu_create")],
         [InlineKeyboardButton("🔍 Search / Current Affairs", callback_data="menu_search")],
         [InlineKeyboardButton("📘 Static GK", callback_data="topic_static_gk"), InlineKeyboardButton("📰 Current Affairs", callback_data="topic_current_affairs")],
+        [InlineKeyboardButton("📚 NCERT Class 6–12 Quiz", callback_data="menu_ncert")],
         [InlineKeyboardButton("📚 Lucent / Saar Sangrah Scan", callback_data="menu_bookscan")],
         [InlineKeyboardButton("🛒 Quiz Store", callback_data="menu_store")],
         [InlineKeyboardButton("🛑 Stop Running Quiz", callback_data="menu_stop")]
@@ -288,7 +317,7 @@ async def show_quiz_card(chat_id, qid, uid, context: ContextTypes.DEFAULT_TYPE):
     
     kb = []
     if has:
-        kb.append([InlineKeyboardButton("🚀 Start Quiz (I am ready!)", callback_data=f"startready_{qid}")])
+        kb.append([InlineKeyboardButton("🚀 Start Quiz", callback_data=f"startready_{qid}")])
     else:
         kb.append([InlineKeyboardButton(f"💳 Buy Now (₹{qz['price']})", callback_data=f"buy_{qid}")])
     kb.append([InlineKeyboardButton("👥 Start in Group", url=group_url)])
@@ -304,7 +333,7 @@ Include:
 1. Core Concepts & Chronology / Key Facts
 2. Important Exam Points (Bullet format)
 3. 10 Most Expected Multiple Choice Questions with Answers at the end.
-Language: Roman Hindi + simple English only. Devanagari script mat use karo, taaki PDF har server par sahi render ho."""
+Language: पूरी तरह हिंदी (Devanagari) में लिखो। Roman Hindi/Hinglish बिल्कुल मत लिखो। केवल जरूरी English technical terms, abbreviations और exam terms को English में रख सकते हो."""
 
     try:
         raw_text = await generate_ai_text(prompt)
@@ -369,23 +398,42 @@ async def finalize_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_image_bytes(p_bytes, msg, uid):
     try:
-        pil_img = Image.open(io.BytesIO(p_bytes)).convert("RGB")
-        pil_img.thumbnail((2048, 2048))
-        
+        if uid not in creation_state:
+            raise Exception("Pehle Photo → Quiz ya NCERT mode select karein")
+        pil_img = Image.open(io.BytesIO(bytes(p_bytes))).convert("RGB")
+        # OCR-friendly preprocessing: upscale small pages, contrast and light sharpening.
+        w, h = pil_img.size
+        max_side = max(w, h)
+        if max_side < 1800:
+            scale = min(2.0, 2200 / max_side)
+            pil_img = pil_img.resize((int(w*scale), int(h*scale)), Image.Resampling.LANCZOS)
+        pil_img = ImageOps.autocontrast(pil_img)
+        pil_img = pil_img.filter(ImageFilter.SHARPEN)
+        pil_img.thumbnail((3000, 3000), Image.Resampling.LANCZOS)
         img_byte_arr = io.BytesIO()
-        pil_img.save(img_byte_arr, format='JPEG', quality=85)
+        pil_img.save(img_byte_arr, format="JPEG", quality=95, optimize=True)
         raw_bytes = img_byte_arr.getvalue()
-        
-        res_text = await generate_ai_text(AI_OCR_PROMPT, image_bytes=raw_bytes)
-        qs = parse_questions(res_text)
-        
+
+        # Two-pass approach: image -> exact visible text -> MCQs. This is much more reliable than asking OCR + MCQ in one pass.
+        ocr_prompt = """Read this page exactly. Transcribe all readable educational text, headings, bullets, tables, labels and captions. Preserve Hindi Devanagari, names, numbers, dates and scientific terms. Do not invent or summarize. Output only the transcription."""
+        source_text = await generate_ai_text(ocr_prompt, image_bytes=raw_bytes)
+        if not source_text or len(source_text.strip()) < 30:
+            raise Exception("Page ka text detect nahi hua. Clear, straight, high-resolution photo bhejein.")
+
+        quiz_prompt = AI_TEXT_TO_QUIZ_PROMPT + "\n\n" + source_text[:18000]
+        result = await generate_ai_text(quiz_prompt)
+        qs = parse_questions(result)
+        if not qs:
+            # Retry once with the original vision prompt if parsing failed.
+            result = await generate_ai_text(AI_OCR_PROMPT, image_bytes=raw_bytes)
+            qs = parse_questions(result)
         if qs:
             creation_state[uid]["questions"].extend(qs)
-            await msg.edit_text(f"✅ AI ne is page se **{len(qs)} Questions** banaye!\nTotal Questions: **{len(creation_state[uid]['questions'])}**\n\nAur photos bhejein ya quiz save/start karne ke liye `/done` bhejein.")
+            await msg.edit_text(f"✅ Photo scan successful! {len(qs)} MCQs banaye.\nTotal Questions: {len(creation_state[uid]['questions'])}\n\nAur photos/text bhejo ya /done se save karo.")
         else:
-            await msg.edit_text("⚠️ Questions extract nahi ho sake. Clear photo bhejein.")
+            await msg.edit_text("⚠️ Text read hua, lekin MCQ format nahi bana. Photo ko seedha, bright aur high-resolution rakho; phir dobara bhejo.")
     except Exception as e:
-        await msg.edit_text(f"⚠️ Scan error: {str(e)[:120]}")
+        await msg.edit_text(f"⚠️ Scan error: {str(e)[:350]}")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -445,6 +493,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     st = creation_state[uid]
+    if st.get("step") == "NCERT_TEXT":
+        if text.lower() in ["/done", "done"]:
+            await finalize_quiz(update, context)
+            return
+        status = await update.message.reply_text("🤖 Chapter text se MCQs bana raha hoon...")
+        try:
+            st["source_text"] = (st.get("source_text", "") + "\n" + text).strip()
+            source = st["source_text"]
+            # Generate in bounded chunks to avoid oversized API requests.
+            await make_quiz_from_source_text(uid, source[-24000:], status, st.get("subject", "NCERT Chapter"))
+            st["source_text"] = ""
+        except Exception as e:
+            await status.edit_text(f"⚠️ NCERT Quiz Error: {str(e)[:250]}")
+        return
+
     if st["step"] == "TITLE":
         st["title"] = text
         st["step"] = "SUBJECT"
@@ -462,6 +525,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if qs:
             st["questions"].extend(qs)
             await update.message.reply_text(f"✅ {len(qs)} Qs add hue! Total: {len(st['questions'])}\nSave karne ke liye `/done` likhein.")
+        elif st.get("subject", "").startswith("NCERT"):
+            status = await update.message.reply_text("🤖 NCERT chapter text se MCQs bana raha hoon...")
+            try:
+                await make_quiz_from_source_text(uid, text, status, st.get("subject", "NCERT"))
+            except Exception as e:
+                await status.edit_text(f"⚠️ NCERT Quiz Error: {str(e)[:250]}")
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -511,6 +580,46 @@ Do not claim that this is verbatim content from any copyrighted commercial book.
     except Exception as e:
         await status.edit_text(f"⚠️ AI Error: {str(e)[:250]}")
 
+async def show_ncert_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [
+        [InlineKeyboardButton("🎓 Class 6", callback_data="ncert_class_6"), InlineKeyboardButton("🎓 Class 7", callback_data="ncert_class_7")],
+        [InlineKeyboardButton("🎓 Class 8", callback_data="ncert_class_8"), InlineKeyboardButton("🎓 Class 9", callback_data="ncert_class_9")],
+        [InlineKeyboardButton("🎓 Class 10", callback_data="ncert_class_10"), InlineKeyboardButton("🎓 Class 11", callback_data="ncert_class_11")],
+        [InlineKeyboardButton("🎓 Class 12", callback_data="ncert_class_12")],
+        [InlineKeyboardButton("📸 Scan Chapter Page", callback_data="menu_photo")],
+        [InlineKeyboardButton("📝 Send Chapter Text", callback_data="ncert_text")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")]
+    ]
+    target = update.callback_query.message if update.callback_query else update.message
+    await target.reply_text(
+        "📚 NCERT Class 6–12 Quiz\n\nClass choose karo. Uske baad chapter ka text ya pages bhejo; bot source ke basis par objective MCQs banayega.",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def ncert_text_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    creation_state[uid] = {
+        "title": "NCERT Chapter Quiz", "subject": "NCERT", "price": 0,
+        "timer": 15, "questions": [], "step": "NCERT_TEXT", "source_text": ""
+    }
+    target = update.callback_query.message if update.callback_query else update.message
+    await target.reply_text(
+        "📝 NCERT chapter ka text paste karo. Main isi text se Hindi objective MCQs banaunga.\n\n"
+        "Bada chapter ho to parts mein bhejo; end mein /done bhejo."
+    )
+
+async def make_quiz_from_source_text(uid, text, msg, subject="NCERT Chapter"):
+    prompt = AI_TEXT_TO_QUIZ_PROMPT + "\n\n" + text[:24000]
+    result = await generate_ai_text(prompt)
+    qs = parse_questions(result)
+    if not qs:
+        raise Exception("AI ne valid MCQ format return nahi kiya")
+    creation_state[uid]["questions"].extend(qs)
+    await msg.edit_text(
+        f"✅ {len(qs)} MCQs ban gaye. Total: {len(creation_state[uid]['questions'])}\n"
+        "Aur chapter text/page bhej sakte ho. Save/start ke liye /done bhejo."
+    )
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -523,6 +632,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d == "menu_photo":
         creation_state[uid] = {"title": "Photo Scan Quiz", "subject": "Scanned Notes", "price": 0, "timer": 15, "questions": [], "step": "QUESTIONS", "auto_photo": True}
         await q.edit_message_text("📸 Ab book/notes ka clear PHOTO bhejo. Main usse objective MCQs bana dunga. Multiple photos bhej sakte ho; end me /done bhejo.")
+    elif d == "menu_ncert":
+        await show_ncert_menu(update, context)
+    elif d.startswith("ncert_class_"):
+        cls = d.rsplit("_", 1)[1]
+        creation_state[uid] = {"title": f"NCERT Class {cls} Chapter Quiz", "subject": f"NCERT Class {cls}", "price": 0, "timer": 15, "questions": [], "step": "NCERT_TEXT", "source_text": "", "auto_photo": True}
+        await q.edit_message_text(f"🎓 NCERT Class {cls} selected.\n\n📸 Chapter page ki clear photo bhejo, ya text paste karo. Main usi source se objective MCQs banaunga. End me /done.")
+    elif d == "ncert_text":
+        await ncert_text_start(update, context)
     elif d == "menu_bookscan":
         creation_state[uid] = {"title": "Book Scan Quiz", "subject": "Book Scan", "price": 0, "timer": 15, "questions": [], "step": "QUESTIONS", "auto_photo": True}
         await q.edit_message_text("📚 Lucent 2026, Saar Sangrah ya kisi bhi apni book/notes ke pages ka PHOTO bhejo. Main sirf tumhare bheje hue pages ko scan karke MCQs banaunga. End me /done bhejo.")
@@ -553,8 +670,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qz = db["quizzes"].get(d.split("_", 1)[1])
         await q.edit_message_text(f"💳 **Pay ₹{qz['price']} to UPI:** `{UPI_ID}`\n\nPayment details Admin ko bhejein:\n🆔 UID: `{uid}` | QID: `{qz['id']}`", parse_mode="Markdown")
     elif d.startswith("startready_"):
-        qid = d.split("_", 1)[1]
-        active_sessions[cid] = {"quiz": db["quizzes"][qid], "stats": {}, "map": {}, "run": True}
+        qid = d[len("startready_"):]
+        if qid not in db.get("quizzes", {}):
+            await q.edit_message_text("⚠️ Quiz nahi mila.")
+            return
+        # Shuffle is always ON; no ON/OFF option is shown to the user.
+        active_sessions[cid] = {"quiz": db["quizzes"][qid], "stats": {}, "map": {}, "run": True, "shuffle": True}
         
         cd_msg = await q.edit_message_text("🔥 **Ready...**", parse_mode="Markdown")
         await asyncio.sleep(1)
@@ -573,7 +694,11 @@ async def run_quiz(chat_id, context: ContextTypes.DEFAULT_TYPE):
     s = active_sessions.get(chat_id)
     if not s:
         return
-    for idx, qd in enumerate(s["quiz"]["questions"]):
+    questions = list(s["quiz"]["questions"])
+    if s.get("shuffle"):
+        random.shuffle(questions)
+
+    for idx, qd in enumerate(questions):
         if not s.get("run"):
             break
         try:
@@ -665,6 +790,7 @@ async def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("ncert", show_ncert_menu))
     app.add_handler(CommandHandler("create_quiz", create_quiz_cmd))
     app.add_handler(CommandHandler("done", finalize_quiz))
     app.add_handler(CommandHandler("store", store_cmd))
