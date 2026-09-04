@@ -1,16 +1,15 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
-# Tesseract aur OpenCV ki system dependencies
-RUN apt-get update && apt-get install -y \
-    tesseract-ocr \
-    tesseract-ocr-hin \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
+RUN python -m pip install --upgrade pip && \
+    pip install -r requirements.txt
+
+COPY bot.py .
 
 CMD ["python", "bot.py"]
